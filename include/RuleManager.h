@@ -1,6 +1,8 @@
 #pragma once
 #include <shared_mutex>
 #include <future>
+#include <set>
+#include <utility>
 
 namespace OIF
 {
@@ -161,6 +163,8 @@ namespace OIF
 		std::uint32_t isInitiallyDisabled{ 2 }; 							// 0 - not initially disabled, 1 - initially disabled, 2 - all/undefined
 		std::int32_t destructionStage{ -1 }; 								// destruction stage to match, -1 - any stage
 		std::uint32_t isStacked{ 2 };										// 0 - not in stack, 1 - in stack, 2 - all/undefined
+		std::uint32_t isParented{ 2 };										// 0 - no enable parent, 1 - has enable parent, 2 - all/undefined
+		std::uint32_t isOwned{ 2 };											// 0 - no ownership, 1 - has ownership, 2 - all/undefined
 		
 		// New hit-specific filters
 		std::unordered_set<std::string> weaponsTypes;          	 			// weapon type categories
@@ -582,17 +586,50 @@ namespace OIF
 				if (currentTimerValue > 0.0f) {
 					static std::vector<std::future<void>> effectTimerTasks;
 					static std::mutex effectTimerMutex;
-					auto effectTimerFuture = std::async(std::launch::async, [this, dataList, ctx, applyEffect, currentTimerValue, matchFilterRecheck, &currentRule]() {
+					static std::set<std::pair<RE::FormID, const void*>> pendingTimerKeys;
+					static std::mutex pendingTimerKeysMutex;
+
+					// Guard against runaway thread stacking. Some events (OnUpdate in
+					// particular) re-trigger the same matching target repeatedly with no
+					// cooldown, so without this guard a rule with a timer longer than the
+					// re-trigger interval would spawn a brand new sleeping OS thread every
+					// re-trigger, indefinitely, for as long as the target keeps matching -
+					// causing steadily worsening lag the longer the player stays nearby.
+					auto timerKey = std::make_pair(ctx.target ? ctx.target->GetFormID() : 0u, static_cast<const void*>(&eff));
+					{
+						std::lock_guard<std::mutex> pendingLock(pendingTimerKeysMutex);
+						if (!pendingTimerKeys.insert(timerKey).second) {
+							return;
+						}
+					}
+
+					// Capture a VALUE COPY of the rule (not a reference). currentRule is a
+					// reference to a Rule that lives in the caller's stack frame (see
+					// RuleManager::ApplyEffect's AddTask lambda); that frame is gone long
+					// before this delayed task runs, so capturing "&currentRule" here was
+					// a dangling reference and undefined behavior - a very plausible source
+					// of intermittent, hard-to-reproduce crashes for any effect using a
+					// "timer" with "matchfilterrecheck".
+					Rule ruleCopy = currentRule;
+					auto effectTimerFuture = std::async(std::launch::async, [this, dataList, ctx, applyEffect, currentTimerValue, matchFilterRecheck, ruleCopy, timerKey]() mutable {
 						std::this_thread::sleep_for(std::chrono::duration<float>(currentTimerValue));
 
-						SKSE::GetTaskInterface()->AddTask([this, dataList, ctx, applyEffect, matchFilterRecheck, &currentRule]() mutable {
+						SKSE::GetTaskInterface()->AddTask([this, dataList, ctx, applyEffect, matchFilterRecheck, ruleCopy, timerKey]() mutable {
+							struct PendingTimerGuard {
+								std::pair<RE::FormID, const void*> key;
+								~PendingTimerGuard() {
+									std::lock_guard<std::mutex> guard(pendingTimerKeysMutex);
+									pendingTimerKeys.erase(key);
+								}
+							} pendingGuard{ timerKey };
+
 							auto* target = ctx.target;
 							auto* source = ctx.source;
 							if (!target || target->IsDeleted()) return;
 							if (source && source->IsDeleted()) return;
 							if (matchFilterRecheck == 1) {
-								Rule& mutableRule = const_cast<Rule&>(currentRule);
-								if (!MatchFilter(currentRule.filter, ctx, mutableRule)) return;
+								Rule mutableRule = ruleCopy;
+								if (!MatchFilter(mutableRule.filter, ctx, mutableRule)) return;
 							}
 							applyEffect(ctx, dataList);
 						});
