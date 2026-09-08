@@ -223,6 +223,15 @@ namespace OIF
         std::size_t processedCount = 0;
         std::size_t skippedCount = 0;
 
+        // Collect matching references first, without triggering anything. Calling
+        // RuleManager::Trigger() (and whatever effects/hooks - ours or another mod's -
+        // it can indirectly set off) from inside TESObjectCELL::ForEachReference's active
+        // iteration risks the iterator handing us a stale/freed reference on its next
+        // step if anything invalidates an object in this same cell mid-iteration. Doing
+        // the actual triggering only after the iteration has fully returned removes that
+        // window entirely.
+        std::vector<RE::TESObjectREFR*> matched;
+
         cell->ForEachReference([&](RE::TESObjectREFR* ref) -> RE::BSContainer::ForEachResult {
             if (!EventSinkBase::IsItemSafe(ref)) return RE::BSContainer::ForEachResult::kContinue;
 
@@ -233,29 +242,34 @@ namespace OIF
                         return RE::BSContainer::ForEachResult::kContinue;
                     }
                 }
-               
-                processedCount++;
 
-                RuleContext ctx{
-                    eventType,
-                    source, 
-                    ref,
-                    nullptr,
-                    nullptr,
-                    "",
-                    "",
-                    "",
-                    false,
-                    weather
-                };
-                
-                RuleManager::GetSingleton()->Trigger(ctx);
+                processedCount++;
+                matched.push_back(ref);
             } else {
                 if (foundObjects) foundObjects->push_back(ref);
             }
 
             return RE::BSContainer::ForEachResult::kContinue;
         });
+
+        for (auto* ref : matched) {
+            if (!EventSinkBase::IsItemSafe(ref)) continue;
+
+            RuleContext ctx{
+                eventType,
+                source, 
+                ref,
+                nullptr,
+                nullptr,
+                "",
+                "",
+                "",
+                false,
+                weather
+            };
+
+            RuleManager::GetSingleton()->Trigger(ctx);
+        }
     }
 
 	void HandleProjectileImpact(RE::Projectile* a_proj, const RE::NiPoint3& a_hitPos) 
@@ -1368,8 +1382,8 @@ namespace OIF
 
 		auto crosshair = RE::CrosshairPickData::GetSingleton();
 		if (crosshair) {
-			if (crosshair->target && crosshair->target->get()) {
-				if (auto* ref = crosshair->target->get().get()) {
+			if (crosshair->target[0] && crosshair->target[0].get()) {
+				if (auto* ref = crosshair->target[0].get().get()) {
 					if (EventSinkBase::IsItemSafe(ref)) {
 						if (auto* baseObj = ref->GetBaseObject()) {
 							switch (baseObj->GetFormType()) {
@@ -1529,12 +1543,41 @@ namespace OIF
     void RegisterSinks()
     {
         auto holder = RE::ScriptEventSourceHolder::GetSingleton();
-        holder->GetEventSource<RE::TESActivateEvent>()->AddEventSink(ActivateSink::GetSingleton());
-        holder->GetEventSource<RE::TESHitEvent>()->AddEventSink(HitSink::GetSingleton());
-        holder->GetEventSource<RE::TESGrabReleaseEvent>()->AddEventSink(GrabReleaseSink::GetSingleton());
-        holder->GetEventSource<RE::TESCellAttachDetachEvent>()->AddEventSink(CellAttachDetachSink::GetSingleton());
-        holder->GetEventSource<RE::TESMagicEffectApplyEvent>()->AddEventSink(MagicEffectApplySink::GetSingleton());
-        holder->GetEventSource<RE::TESDestructionStageChangedEvent>()->AddEventSink(DestructionStageChangedSink::GetSingleton());
+        if (!holder) {
+            logger::error("RegisterSinks: RE::ScriptEventSourceHolder::GetSingleton() returned null - no event sinks were registered");
+            return;
+        }
+
+        if (auto* src = holder->GetEventSource<RE::TESActivateEvent>()) {
+            src->AddEventSink(ActivateSink::GetSingleton());
+        } else {
+            logger::error("RegisterSinks: TESActivateEvent source unavailable");
+        }
+        if (auto* src = holder->GetEventSource<RE::TESHitEvent>()) {
+            src->AddEventSink(HitSink::GetSingleton());
+        } else {
+            logger::error("RegisterSinks: TESHitEvent source unavailable");
+        }
+        if (auto* src = holder->GetEventSource<RE::TESGrabReleaseEvent>()) {
+            src->AddEventSink(GrabReleaseSink::GetSingleton());
+        } else {
+            logger::error("RegisterSinks: TESGrabReleaseEvent source unavailable");
+        }
+        if (auto* src = holder->GetEventSource<RE::TESCellAttachDetachEvent>()) {
+            src->AddEventSink(CellAttachDetachSink::GetSingleton());
+        } else {
+            logger::error("RegisterSinks: TESCellAttachDetachEvent source unavailable");
+        }
+        if (auto* src = holder->GetEventSource<RE::TESMagicEffectApplyEvent>()) {
+            src->AddEventSink(MagicEffectApplySink::GetSingleton());
+        } else {
+            logger::error("RegisterSinks: TESMagicEffectApplyEvent source unavailable");
+        }
+        if (auto* src = holder->GetEventSource<RE::TESDestructionStageChangedEvent>()) {
+            src->AddEventSink(DestructionStageChangedSink::GetSingleton());
+        } else {
+            logger::error("RegisterSinks: TESDestructionStageChangedEvent source unavailable");
+        }
 		
 		// Currently disabled, still in development
 		//holder->GetEventSource<RE::TESContainerChangedEvent>()->AddEventSink(DropSink::GetSingleton());
@@ -1542,12 +1585,32 @@ namespace OIF
 
     void InstallHooks() 
     {
+        // Note: these do the same thing as the ::stl::write_thunk_call / ::stl::write_vfunc
+        // helpers declared in PCH.h, but are inlined directly here so hook installation
+        // doesn't depend on that project-level 'stl' namespace being visible - some build
+        // setups (e.g. clibdt) were not resolving it at this call site.
         REL::Relocation<std::uintptr_t> weatherChangeHook{ REL::VariantID(25684, 26231, 25684), REL::VariantOffset(0x44F, 0x46C, 0x44F) };
-        ::stl::write_thunk_call<WeatherChangeHook>(weatherChangeHook.address());
-		::stl::write_vfunc<RE::ReadyWeaponHandler, ReadyWeaponHook>();
-        ::stl::write_vfunc<RE::Explosion, ExplosionHook>();
-		::stl::write_vfunc<RE::PlayerCharacter, UpdateHook>();
-		::stl::write_vfunc<RE::AttackBlockHandler, AttackBlockHook>();
+        {
+            SKSE::AllocTrampoline(14);
+            auto& trampoline = SKSE::GetTrampoline();
+            WeatherChangeHook::func = trampoline.write_call<5>(weatherChangeHook.address(), WeatherChangeHook::thunk);
+        }
+        {
+            REL::Relocation<std::uintptr_t> vtbl{ RE::ReadyWeaponHandler::VTABLE[0] };
+            ReadyWeaponHook::func = vtbl.write_vfunc(ReadyWeaponHook::size, ReadyWeaponHook::thunk);
+        }
+        {
+            REL::Relocation<std::uintptr_t> vtbl{ RE::Explosion::VTABLE[0] };
+            ExplosionHook::func = vtbl.write_vfunc(ExplosionHook::size, ExplosionHook::thunk);
+        }
+        {
+            REL::Relocation<std::uintptr_t> vtbl{ RE::PlayerCharacter::VTABLE[0] };
+            UpdateHook::func = vtbl.write_vfunc(UpdateHook::size, UpdateHook::thunk);
+        }
+        {
+            REL::Relocation<std::uintptr_t> vtbl{ RE::AttackBlockHandler::VTABLE[0] };
+            AttackBlockHook::func = vtbl.write_vfunc(AttackBlockHook::size, AttackBlockHook::thunk);
+        }
 		
 		// Currently disabled due to instability issues
 		//::stl::write_vfunc<RE::MissileProjectile, MissileImpactHook>();

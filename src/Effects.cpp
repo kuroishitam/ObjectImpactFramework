@@ -1,4 +1,5 @@
 #include "Effects.h"
+#include "RE/E/ExtraOwnership.h"
 #include <future>
 #include "RuleManager.h"
 
@@ -175,6 +176,17 @@ namespace OIF::Effects
 
     // Execute a list of commands in the console - taken and adapted from the ConsoleUtil NG source code
     void ExecuteCommand(const std::string& command, RE::TESObjectREFR* targetRef = nullptr) {
+        // compileAndRun below drives the game's own script compiler/VM synchronously, and
+        // commands like "enable"/"disable" can trigger native side effects that reenter the
+        // Papyrus VM (e.g. firing a vanilla OnCellLoad handler on the target or a linked
+        // reference). If the target's cell isn't fully attached yet, those handlers can run
+        // against companion objects that are still mid-initialization and crash. Skip rather
+        // than risk running a command against a reference that isn't safely loaded.
+        if (targetRef && (!targetRef->GetParentCell() || !targetRef->GetParentCell()->IsAttached())) {
+            logger::warn("ExecuteCommand: Skipping '{}' - target's cell is not attached", command);
+            return;
+        }
+
         const auto scriptFactory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::Script>();
         const auto script = scriptFactory ? scriptFactory->Create() : nullptr;
         
@@ -211,11 +223,55 @@ namespace OIF::Effects
         func(ref, scale);
     }
 
-	// Copy ownership from one reference to another
-	void CopyOwnership(RE::TESObjectREFR* from, RE::TESObjectREFR* to)
+	// These are the reference types that can normally be picked up into the
+	// player's inventory. Do not alter ownership on world objects such as
+	// Activators, Movable Statics, Statics, Trees, Furniture, etc.
+	bool IsPickableItem(RE::TESObjectREFR* ref)
 	{
-		if (!from || !to || !from->GetOwner()) return;
-		if (auto* owner = from->GetOwner()) to->SetOwner(owner);
+		if (!ref || ref->IsDeleted()) return false;
+		auto* base = ref->GetBaseObject();
+		if (!base) return false;
+
+		switch (base->GetFormType()) {
+		case RE::FormType::Ammo:
+		case RE::FormType::Armor:
+		case RE::FormType::Book:
+		case RE::FormType::Ingredient:
+		case RE::FormType::KeyMaster:
+		case RE::FormType::Misc:
+		case RE::FormType::Weapon:
+		case RE::FormType::AlchemyItem:
+		case RE::FormType::SoulGem:
+		case RE::FormType::Scroll:
+		case RE::FormType::Note:
+		case RE::FormType::Light:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	// Copy only EXPLICIT reference ownership to newly-created pickable items.
+	// TESObjectREFR::GetOwner() can fall back to the containing cell/location
+	// owner. That fallback is exactly what we do NOT want here: a dropped item
+	// that belongs to the player must stay player-owned after a swap/respawn,
+	// while an otherwise-unowned item inside an owned interior must remain
+	// unowned rather than becoming owned by the house/shop.
+	void NormalizePickableOwnership(RE::TESObjectREFR* spawned, RE::TESObjectREFR* source)
+	{
+		if (!IsPickableItem(spawned) || !source) return;
+
+		RE::TESForm* explicitOwner = nullptr;
+
+		if (auto* ownership = source->extraList.GetByType<RE::ExtraOwnership>()) {
+			explicitOwner = ownership->owner;
+		}
+
+		// Set the exact explicit ownership state from the source:
+		//   - player owner -> remains player-owned, so pickup is not stealing
+		//   - NPC/faction/etc. owner -> remains owned by that owner
+		//   - no ExtraOwnership -> no owner, regardless of cell/location ownership
+		spawned->SetOwner(explicitOwner);
 	}
 
 // ╔════════════════════════════════════╗
@@ -495,6 +551,7 @@ namespace OIF::Effects
                         ApplyFade(spawnedItem);
                     }
                 }
+                NormalizePickableOwnership(spawnedItem.get(), target);
             }
             return spawnedItem;
         }
@@ -532,8 +589,11 @@ namespace OIF::Effects
                 if (fade == 0) {
                     ApplyFade(spawned);
                 }
+                NormalizePickableOwnership(spawned.get(), target);
                 return spawned;
             }
+            logger::warn("Spawn: Direct spawn fallback also failed");
+            return nullptr;
         }
     
         // Create the dummy
@@ -545,8 +605,11 @@ namespace OIF::Effects
                 if (fade == 0) {
                     ApplyFade(spawned);
                 }
+                NormalizePickableOwnership(spawned.get(), target);
                 return spawned;
             }
+            logger::warn("Spawn: Direct spawn fallback also failed");
+            return nullptr;
         }
     
         // Validate dummy state before proceeding
@@ -564,8 +627,11 @@ namespace OIF::Effects
                 if (fade == 0) {
                     ApplyFade(spawned);
                 }
+                NormalizePickableOwnership(spawned.get(), target);
                 return spawned;
             }
+            logger::warn("Spawn: Direct spawn fallback also failed");
+            return nullptr;
         }
 
         // For type 9, try to find the specific node first
@@ -666,7 +732,11 @@ namespace OIF::Effects
                 logger::error("Spawn: Exception while cleaning up dummy");
             }
         }
-    
+
+        if (spawned && !spawned->IsDeleted()) {
+            NormalizePickableOwnership(spawned.get(), target);
+        }
+
         return spawned;
     }
 
@@ -965,10 +1035,27 @@ namespace OIF::Effects
             return;
         }
 
+        // Preserve only explicit reference ownership on the temporary dummy.
+        // Do NOT use GetOwner() here because it can resolve the containing
+        // cell/location owner. A player-dropped item may explicitly belong to
+        // the player, and that ownership must survive DisableItem/EnableItem.
+        // Conversely, an unowned item inside an owned interior must remain
+        // unowned.
+        RE::TESForm* originalOwner = nullptr;
+        if (IsPickableItem(ctx.target)) {
+            if (auto* ownership = ctx.target->extraList.GetByType<RE::ExtraOwnership>()) {
+                originalOwner = ownership->owner;
+            }
+        }
+
         auto dummy = ctx.target->PlaceObjectAtMe(dummyForm, true);
         if (!dummy) {
             logger::error("DisableItem: Failed to create dummy (required for respawning)");
             return;
+        }
+
+        if (IsPickableItem(ctx.target)) {
+            dummy->SetOwner(originalOwner);
         }
     
         dummy->SetPosition(pos);
@@ -1050,6 +1137,11 @@ namespace OIF::Effects
             logger::error("EnableItem: Failed to recreate original object");
             return;
         }
+
+        // Restore the original explicit reference ownership. In particular,
+        // a player-dropped item remains player-owned after DisableItem/EnableItem,
+        // while an unowned item does not inherit the interior/cell owner.
+        NormalizePickableOwnership(orig.get(), foundDummy);
 
         orig->SetPosition(pos);
         orig->data.angle = foundDummy->data.angle;
@@ -1323,7 +1415,7 @@ namespace OIF::Effects
             for (std::uint32_t i = 0; i < itemData.count.value; ++i) {
                 auto item = Spawn(ctx.target, itemData.item, itemData.spawnType, itemData.fade, itemData.string);
                 if (item && ctx.target) {
-                    CopyOwnership(ctx.target, item.get());
+                    NormalizePickableOwnership(item.get(), ctx.target);
                     if (itemData.scale.value == -1.0f) {
                         SetObjectScale(item.get(), ctx.target->GetScale());
                     } else {
@@ -1355,7 +1447,7 @@ namespace OIF::Effects
 				auto item = Spawn(ctx.target, itemData.item, itemData.spawnType, itemData.fade, itemData.string);
 				if (item && ctx.target) {
 					anyItemSpawned = true;
-					CopyOwnership(ctx.target, item.get());
+					NormalizePickableOwnership(item.get(), ctx.target);
 					if (itemData.scale.value == -1.0f) {
 						SetObjectScale(item.get(), ctx.target->GetScale());
 					} else {
@@ -1404,7 +1496,7 @@ namespace OIF::Effects
 
 				auto item = Spawn(ctx.target, obj, itemData.spawnType, itemData.fade, itemData.string);
 				if (item && ctx.target) {
-					CopyOwnership(ctx.target, item.get());
+					NormalizePickableOwnership(item.get(), ctx.target);
 					if (itemData.scale.value == -1.0f) {
 						SetObjectScale(item.get(), ctx.target->GetScale());
 					} else {
@@ -1444,7 +1536,7 @@ namespace OIF::Effects
 				auto item = Spawn(ctx.target, obj, itemData.spawnType, itemData.fade, itemData.string);
 				if (item && ctx.target) {
 					spawned = true;
-					CopyOwnership(ctx.target, item.get());
+					NormalizePickableOwnership(item.get(), ctx.target);
 					if (itemData.scale.value == -1.0f) {
 						SetObjectScale(item.get(), ctx.target->GetScale());
 					} else {

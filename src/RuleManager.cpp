@@ -425,14 +425,23 @@ namespace OIF {
 	}
 
     bool CheckActorValueCondition(const ActorValueCondition& condition, RE::Actor* actor) {
+        if (!actor) return false;
+
         RE::ActorValue av = GetActorValueFromString(condition.actorValue);
         if (av == RE::ActorValue::kNone) return false;
-        
-        auto* npc = actor->As<RE::TESNPC>();
-        if (!npc) return false;
-        
-        float currentValue = npc->GetActorValue(av);
-        
+
+        // Actor values must be read from the actor reference itself (RE::Actor
+        // implements RE::ActorValueOwner), NOT from the base NPC_ form. An
+        // Actor will never successfully cast to TESNPC, so the old code
+        // (actor->As<RE::TESNPC>()) always returned nullptr and this
+        // condition always evaluated to false. AsActorValueOwner() is used
+        // instead of a direct call because some CommonLibSSE-NG revisions
+        // don't expose ActorValueOwner's members as directly-inherited
+        // members of Actor.
+        auto* avOwner = actor->AsActorValueOwner();
+        if (!avOwner) return false;
+        float currentValue = avOwner->GetActorValue(av);
+
         return CompareValues(condition.operator_type, currentValue, condition.value);
     }
 
@@ -2448,6 +2457,22 @@ namespace OIF {
 					}
 				}
 
+				if (jf.contains("isparented") && jf["isparented"].is_number_unsigned()) {
+					try {
+						r.filter.isParented = jf["isparented"].get<std::uint32_t>();
+					} catch (const std::exception& e) {
+						logger::warn("Invalid isparented value in isparented filter of {}: {}", path.string(), e.what());
+					}
+				}
+
+				if (jf.contains("isowned") && jf["isowned"].is_number_unsigned()) {
+					try {
+						r.filter.isOwned = jf["isowned"].get<std::uint32_t>();
+					} catch (const std::exception& e) {
+						logger::warn("Invalid isowned value in isowned filter of {}: {}", path.string(), e.what());
+					}
+				}
+
 				if (jf.contains("isinterior") && jf["isinterior"].is_number_unsigned()) {
 					try {
 						r.filter.isInterior = jf["isinterior"].get<std::uint32_t>();
@@ -2595,15 +2620,20 @@ namespace OIF {
 						for (const auto& itemJson : effj["items"]) {
 							EffectExtendedData extData;
 							extData.formID = nullptr;
-							extData.nonDeletable = itemJson.value("nondeletable", 0U);
-							extData.spawnType = itemJson.value("spawntype", 4U);
-							extData.fade = itemJson.value("fade", 1U);
-							extData.duration = itemJson.value("duration", 1.0f);
-							extData.string = itemJson.value("string", std::string{});
-							extData.mode = itemJson.value("mode", 0U);
-							extData.strings = itemJson.value("strings", std::vector<std::string>{});
-							//extData.flagNames = itemJson.value("flagnames", std::vector<std::string>{});
-							extData.rank = itemJson.value("rank", 0U);
+							try {
+								extData.nonDeletable = itemJson.value("nondeletable", 0U);
+								extData.spawnType = itemJson.value("spawntype", 4U);
+								extData.fade = itemJson.value("fade", 1U);
+								extData.duration = itemJson.value("duration", 1.0f);
+								extData.string = itemJson.value("string", std::string{});
+								extData.mode = itemJson.value("mode", 0U);
+								extData.strings = itemJson.value("strings", std::vector<std::string>{});
+								//extData.flagNames = itemJson.value("flagnames", std::vector<std::string>{});
+								extData.rank = itemJson.value("rank", 0U);
+							} catch (const std::exception& e) {
+								logger::warn("Skipping malformed item in effect '{}' of {}: {}", typeStr, path.string(), e.what());
+								continue;
+							}
 							if (itemJson.contains("count") && (itemJson["count"].is_number_unsigned() || itemJson["count"].is_object())) {
 								if (itemJson["count"].is_number_unsigned()) {
 									try {
@@ -2798,7 +2828,15 @@ namespace OIF {
 
 							else if (itemJson.contains("editorid") && itemJson["editorid"].is_string()) {
 								std::string editorId = itemJson["editorid"].get<std::string>();
-								if (auto* form = GetFormFromEditorID<RE::TESForm>(editorId)) {
+								// EditorID lookups in CommonLibSSE-NG are keyed by the concrete form
+								// type, not by the generic TESForm base - looking up a Sound Descriptor
+								// (or any other specifically-typed item) via RE::TESForm never consults
+								// that type's own EditorID cache and always fails, even for types like
+								// Sound Descriptors whose EditorIDs are natively available at runtime.
+								RE::TESForm* form = (eff.type == EffectType::kPlaySound)
+									? static_cast<RE::TESForm*>(GetFormFromEditorID<RE::BGSSoundDescriptorForm>(editorId))
+									: GetFormFromEditorID<RE::TESForm>(editorId);
+								if (form) {
 									extData.formID = form;
 									extData.isFormList = false;
 									extData.index = -1;
@@ -3137,6 +3175,33 @@ namespace OIF {
 		if (f.isStacked != 2) {
 			if (f.isStacked == 0 && ctx.target->extraList.GetCount() > 1) return false;
 			if (f.isStacked == 1 && ctx.target->extraList.GetCount() <= 1) return false;
+		}
+		if (f.isParented != 2) {
+			// Skyrim stores a reference's Creation Kit "Enable Parent" in
+			// ExtraEnableStateParent. Treat the filter as parented only when
+			// the extra data exists and resolves to a valid reference.
+			bool hasParent = false;
+			if (auto* parentData = ctx.target->extraList.GetByType<RE::ExtraEnableStateParent>()) {
+				hasParent = parentData->parent.get() != nullptr;
+			}
+
+			if (f.isParented == 1 && !hasParent) return false;
+			if (f.isParented == 0 && hasParent) return false;
+		}
+		if (f.isOwned != 2) {
+			auto* owner = ctx.target->GetOwner();
+			auto* player = RE::PlayerCharacter::GetSingleton();
+
+			const bool hasOwner = owner != nullptr;
+			const bool hasNonPlayerOwner = hasOwner && owner != player;
+
+			// Original behavior: isOwned 1 = has any owner
+			if (f.isOwned == 1 && !hasOwner)
+				return false;
+
+			// New behavior: isOwned 0 = no owner OR player-owned
+			if (f.isOwned == 0 && hasNonPlayerOwner)
+				return false;
 		}
 		if (f.isInterior != 2) {
 			auto* cell = ctx.target->GetParentCell();
@@ -4192,8 +4257,8 @@ namespace OIF {
 
 			r.dynamicIndex = 0;
 			if (!MatchFilter(r.filter, ctx, r)) continue;
-			if (!CheckLocationFilter(r.filter, ctx)) return;
-			if (!CheckWeatherFilter(r.filter)) return;
+			if (!CheckLocationFilter(r.filter, ctx)) continue;
+			if (!CheckWeatherFilter(r.filter)) continue;
 
 			// ╔════════════════════════════════════╗
 			// ║         LIMIT CHECK BLOCK          ║
