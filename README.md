@@ -176,6 +176,34 @@ Below are all possible filter parameters:
    - `1`: Stacked.
    - `2` (default): All allowed.
  
+ - **`isParented`**: An integer specifying whether the object has a valid Creation Kit **Enable Parent** reference attached to it. The filter checks the reference's `ExtraEnableStateParent` data.
+
+   - `0`: Does not have an Enable Parent.
+   - `1`: Has an Enable Parent.
+   - `2` (default): All allowed.
+
+   This is useful for excluding objects that are controlled by another reference, such as hidden fire/light references used by some objects (for example, Khajiit caravan fires).
+
+   Example: affect only fire/light references that are **not** controlled by an Enable Parent:
+
+   ```json
+   {
+       "event": ["WeatherChange"],
+       "filter": {
+           "formTypes": ["light"],
+           "isParented": 0
+       },
+       "effect": [
+           {
+               "type": "DisableItem"
+           }
+       ]
+   }
+   ```
+ - **`isOwned`**: An integer specifying whether the object reference has an owner assigned. `0` = no owner, `1` = has an owner, `2` = ignore ownership. (default)
+ 
+ - **Spawn/swap ownership**: Pickable inventory items created by OIF clear ownership when the source reference is unowned inside an interior cell. If the source already has an NPC/faction/etc. owner, that ownership is preserved. Non-pickable world objects such as Activators and Movable Statics are not modified by this ownership cleanup.
+ 
 - **`lockLevel`**: An integer specifying a lock level the object must have. **Note:** Do *not* use the filter with formTypes other than `door` and `container`.
   - `-2` (default): All allowed.
   - `-1`: Unlocked.
