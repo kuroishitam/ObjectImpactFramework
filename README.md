@@ -200,7 +200,7 @@ Below are all possible filter parameters:
        ]
    }
    ```
- - **`isOwned`**: An integer specifying whether the object reference has an owner assigned. `0` = no owner, `1` = has an owner, `2` = ignore ownership. (default)
+ - **`isOwned`**: An integer specifying whether the object reference has an owner assigned. `0` = no owner (excluding player owned), `1` = has an owner, `2` = ignore ownership. (default)
  
  - **Spawn/swap ownership**: Pickable inventory items created by OIF clear ownership when the source reference is unowned inside an interior cell. If the source already has an NPC/faction/etc. owner, that ownership is preserved. Non-pickable world objects such as Activators and Movable Statics are not modified by this ownership cleanup.
  
