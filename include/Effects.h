@@ -12,6 +12,7 @@ namespace OIF::Effects
 	void ApplySpell(const RuleContext& ctx, const std::vector<SpellSpawnData>& spellsData);
     void SpawnActor(const RuleContext& ctx, const std::vector<ActorSpawnData>& actorsData);
     void SpawnImpactDataSet(const RuleContext& ctx, const std::vector<ImpactDataSetSpawnData>& impactsData);
+    void SpawnImpact(const RuleContext& ctx, const std::vector<ImpactSpawnData>& impactsData);
     void SpawnExplosion(const RuleContext& ctx, const std::vector<ExplosionSpawnData>& explosionsData);
     void SwapItem(const RuleContext& ctx, const std::vector<ItemSpawnData>& itemsData);
     void PlaySound(const RuleContext& ctx, const std::vector<SoundSpawnData>& soundsData);
@@ -52,4 +53,14 @@ namespace OIF::Effects
 	void ExecuteConsoleCommandOnSource(const RuleContext& ctx, const std::vector<StringData>& commandsData);
     void ShowNotification(const RuleContext& ctx, const std::vector<StringData>& notificationsData);
     void ShowMessageBox(const RuleContext& ctx, const std::vector<StringData>& messagesData);
+    void AddBounty(const RuleContext& ctx, const std::vector<BountyData>& bountyData);
+    void ScaleObject(const RuleContext& ctx, const std::vector<ScaleObjectData>& scaleData);
+    void RestoreObjectScale(const RuleContext& ctx, const std::vector<RestoreScaleData>& restoreData);
+    void ModActorValue(const RuleContext& ctx, const std::vector<ModActorValueData>& avData);
+    void ApplyForce(const RuleContext& ctx, const std::vector<ForceApplyData>& forceData);
+    void SpawnHazard(const RuleContext& ctx, const std::vector<HazardSpawnData>& hazardsData);
+    void SwapHazard(const RuleContext& ctx, const std::vector<HazardSpawnData>& hazardsData);
+    void DropHarvest(const RuleContext& ctx, const std::vector<HarvestSpawnData>& harvestsData);
+    void ChangeWeather(const RuleContext& ctx, const std::vector<WeatherChangeData>& weatherData);
+    void SwapBaseObject(const RuleContext& ctx, const std::vector<BaseObjectSwapData>& swapData);
 }
