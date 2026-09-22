@@ -31,6 +31,7 @@ This guide explains how to set up those JSON files so you can create your own mo
 - [Effects: What Happens When the Rule Triggers](#effects-what-happens-when-the-rule-triggers)
   - [Effect Types](#object-management)
   - [Configuring Effects with items](#configuring-effects-with-items)
+- [AddBounty Examples](#addbounty-examples)
 - [Examples](#examples)
 
 ---
@@ -51,8 +52,10 @@ Each rule in your JSON file defines a specific behavior for the mod. Rules are w
   - `"WeatherChange"`: Triggered on weather change.
   - `"OnUpdate"`: Triggered every 1 second.
   - `"DestructionStageChange"`: Triggered on object's destruction stage change. The effect will *not* be applied to the scene when the object is disabled or deleted.
+  - `"HitGround"`: Triggered when a weapon, spell, or projectile hits bare terrain instead of any object. There is no target object for this event, so `formTypes`/`formIDs`/`editorIDs`/`formLists`/`keywords` filters are not required and effects that need to act on a target reference (e.g. `RemoveItem`, `SwapItem`, `ScaleObject`) do not work with it; position-based spawn/sound/notification effects do. **Note:** projectiles report their ground impact accurately, but melee weapons (and hand-to-hand, which never triggers this at all) rely on an approximation of where the swing "would have" hit the ground, since there's no real projectile travelling to a real impact point to hook. This makes a weapon-based `"HitGround"` rule behave a bit like a `"Hit"`-on-weapon-swing rule - it can occasionally fire while you're attacking an NPC or object too, not only genuinely empty ground. If that's a problem, restrict the rule to a specific weapon (`weapons`/`weaponsTypes`) rather than relying on it only ever firing on true misses.
+  - `"HitWater"`: Same as `"HitGround"`, but for a splash on a water surface (a cell's own water, or exterior LOD water) instead of bare terrain. Same lack of a target object, and the same effect support/limits as `"HitGround"`.
   
-- **`filter`**: Defines the targeted objects and the conditions under which a rule applies to them. At least one of `formTypes`, `formIDs`, `editorIDs`, `formLists`, or `keywords` must be provided to identify target objects.
+- **`filter`**: Defines the targeted objects and the conditions under which a rule applies to them. At least one of `formTypes`, `formIDs`, `editorIDs`, `formLists`, or `keywords` must be provided to identify target objects (not required for `"HitGround"`/`"HitWater"` rules, which have no target object).
 
 - **`effect`**: Describes what happens when the rule is triggered. Each effect has a `type` and, for most types, an `items` array specifying what to spawn, swap, or apply.
 
@@ -118,6 +121,10 @@ Below are all possible filter parameters:
 
 - **`formIDsNot`**: An array of strings identifying specific objects that the rule should *not* apply to. Same format as `formIDs`.
 
+- **`references`** (one of the required fields to choose from): An array of strings identifying one or more *specific placed references* by their own FormID, in the same `"modName:formID"` format as `formIDs` — e.g. `"MyMod.esp:0xABCDEF"`. This is different from `formIDs`, which matches *every* instance of a base object (every copy of that chest, every copy of that flora) — `references` matches only that one exact object placed in the world (the FormID you'd get from the in-game console by clicking it, or from the Reference's own FormID in the Render Window in xEdit/CK). Useful for "only this specific door" or "only this one statue" rules. Only works for persistent, pre-placed references from a plugin — it can't target references spawned dynamically at runtime, since those don't have a fixed FormID known ahead of time.
+
+- **`referencesNot`**: An array of strings identifying specific placed references that the rule should *not* apply to. Same format as `references`.
+
 - **`editorIDs`** (one of the required fields to choose from): An array of strings identifying specific objects by their editorID in the format `"EditorIDName"`. Example: `"VendorItemClutter"`.
 
 - **`editorIDsNot`**: An array of strings identifying specific objects that the rule should *not* apply to. Same format as `editorIDs`.
@@ -177,7 +184,7 @@ Below are all possible filter parameters:
    - `2` (default): All allowed.
  
  - **`isParented`**: An integer specifying whether the object has a valid Creation Kit **Enable Parent** reference attached to it. The filter checks the reference's `ExtraEnableStateParent` data.
-
+ 
    - `0`: Does not have an Enable Parent.
    - `1`: Has an Enable Parent.
    - `2` (default): All allowed.
@@ -200,9 +207,14 @@ Below are all possible filter parameters:
        ]
    }
    ```
- - **`isOwned`**: An integer specifying whether the object reference has an owner assigned. `0` = no owner (excluding player owned), `1` = has an owner, `2` = ignore ownership. (default)
- 
- - **Spawn/swap ownership**: Pickable inventory items created by OIF clear ownership when the source reference is unowned inside an interior cell. If the source already has an NPC/faction/etc. owner, that ownership is preserved. Non-pickable world objects such as Activators and Movable Statics are not modified by this ownership cleanup.
+- **`isOwned`**: An integer specifying the ownership state of the object reference.
+  - `0`: Unowned only.
+  - `1`: Owned only (any owner).
+  - `2` (default): Ignore ownership.
+  - `3`: Unowned or player-owned. NPC-, faction-, and other non-player-owned references are excluded.
+  - `4`: Owned except player-owned. Unowned and player-owned references are excluded.
+  
+ - **Spawn/swap ownership**: Pickable inventory items created by OIF clear ownership when the source reference is unowned or player-owned, preventing them from being treated as stolen. If the source already has an NPC/faction/etc. owner, that ownership is preserved. Non-pickable world objects such as Activators and Movable Statics are not modified by this ownership cleanup.
  
 - **`lockLevel`**: An integer specifying a lock level the object must have. **Note:** Do *not* use the filter with formTypes other than `door` and `container`.
   - `-2` (default): All allowed.
@@ -223,6 +235,19 @@ Below are all possible filter parameters:
 - **`isDllInstalled`**: An array of DLL filenames (e.g., `"MyPlugin.dll"`) that must be present in `Data/SKSE/Plugins/`.
 
 - **`isDllNotInstalled`**: An array of DLL filenames that must *not* be present.
+
+- **`materials`**: An array of physical Havok material names the target's collision shape must match (e.g., `["stone", "wood"]`). Matching is a case-insensitive *substring* match against the object's `RE::MATERIAL_ID` name, so `"stone"` matches `kStone`, `kStoneStairs`, `kStoneHeavy`, etc. - you don't need to know the exact internal enum name, just a recognizable fragment of it (`"wood"`, `"metal"`, `"flesh"`, `"snow"`, `"water"`, `"glass"`, and so on). Only resolved when the rule has a real target object (`Hit`/`Activate`/etc. on an actual reference); `"HitGround"`/`"HitWater"` rules have no target reference to read a material from, so this filter never matches for them.
+
+  Example: only trigger on stone or metal surfaces:
+
+  ```json
+  "filter": {
+      "formTypes": ["static"],
+      "materials": ["stone", "metal"]
+  }
+  ```
+
+- **`materialsNot`**: An array of physical material names the target must *not* match. Same format as `materials`. Objects can have several collision parts with different materials: `materials` matches if *any* part matches, `materialsNot` rejects if *any* part matches. If no material can be read at all (no loaded 3D / no collision), `materials` doesn't match, while `materialsNot` passes.
 
 ### Time-Based Filters
 
@@ -269,9 +294,27 @@ Below are all possible filter parameters:
 
 - **`locationsNot`**: An array of cells, locations, or worldspaces where the rule should *not* apply. Same format as `locations`.
 
+- **`locationKeywords`**: An array of Creation Kit keywords that the target's current location - *or any of that location's parent locations* (e.g. a district's parent city, or a city's parent Hold) - must have at least one of. Format: `"modName:formID"` (e.g., `"Skyrim.esm:0xABCDEF"`), `"EditorIDName"` (e.g., `"LocTypeInn"`), or a formlist's formID/editorID.
+
+  Example: only trigger while inside an inn (or a district of one), never in a dungeon (or any of its parent locations):
+
+  ```json
+  "filter": {
+      "locationKeywords": ["LocTypeInn"],
+      "locationKeywordsNot": ["LocTypeDungeon"]
+  }
+  ```
+
+- **`locationKeywordsNot`**: An array of keywords that the target's current location and all of its parent locations must *not* have any of. Same format as `locationKeywords`.
+
 - **`isInterior`**: An integer specifying whether the object is indoors.
   - `0`: Not an interior.
   - `1`: Interior.
+  - `2` (default): All allowed.
+
+- **`isTeleportDoor`**: An integer specifying whether the target door is a load door (linked to a destination elsewhere) as opposed to a door that just opens/closes in place (a cell gate, cabinet door, portcullis, etc.). Only meaningful when the target is a `door`; checked via the reference's `ExtraTeleport` data (present only on doors actually set up to teleport the player). Ground/water hits have no door to check and never match either specific value.
+  - `0`: Door that does *not* teleport (opens in place).
+  - `1`: Door that teleports (a load door).
   - `2` (default): All allowed.
 
 - **`position`**: An integer specifying the object's position in relation to the **player**.
@@ -279,6 +322,14 @@ Below are all possible filter parameters:
   - `1`: Middle.
   - `2`: Above the middle.
   - `3` (default): All allowed.
+
+- **`isInWater`**: An integer specifying whether the object is touching water (a cell's own water, or exterior LOD water).
+  - `0`: Not touching water.
+  - `1`: On the surface (the object straddles the waterline - e.g. floating or partially submerged).
+  - `2`: Fully submerged (entirely below the waterline).
+  - `3` (default): All allowed.
+
+  For `"HitGround"`/`"HitWater"` rules (which have no target object), this reflects which of the two events actually fired (`0` for `"HitGround"`, `1` for `"HitWater"`) rather than re-checking the impact position.
 
 - **`weathers`**: An array of weathers that must be active for the rule to apply. Format: `"modName:formID"` (e.g., `"Skyrim.esm:0xABCDEF"`), `"EditorIDName"` (e.g., `"VendorItemFood"`), or a formlist's formID/editorID.
 
@@ -294,9 +345,19 @@ Below are all possible filter parameters:
 
 - **`spellsNot`**: An array of spells that the event source actor must *not* have. Same format as `spells`.
 
+- **`shouts`**: An array of shouts that the event source actor must know (fully unlocked). Format: `"modName:formID"` (e.g., `"Skyrim.esm:0xABCDEF"`), `"EditorIDName"` (e.g., `"FireBreathShout"`), or a formlist's formID/editorID. Note: shout knowledge is a player-specific mechanic, so this filter is only meaningful when the source actor is the player.
+
+- **`shoutsNot`**: An array of shouts that the event source actor must *not* know. Same format as `shouts`.
+
+- **`shoutWordsKnown`**: An array of objects checking how many words (1-3) of a specific shout are currently unlocked, e.g. `{"shout": "Skyrim.esm:0x0F82BF", "minWords": 1, "maxWords": 3}`. `minWords` defaults to 1, `maxWords` defaults to 3. Like `shouts`, this reflects player-specific word-unlock state, so it's only meaningful when the source actor is the player.
+
 - **`hasItem`**: An array of items that the event source actor must have in their inventory. Format: `"modName:formID"` (e.g., `"Skyrim.esm:0xABCDEF"`), `"EditorIDName"` (e.g., `"VendorItemFood"`), or a formlist's formID/editorID.
 
 - **`hasItemNot`**: An array of items that the event source actor must *not* have. Same format as `hasItem`.
+
+- **`isEquip`**: An array of weapons/armor/other equippable items that the event source actor must currently have equipped or worn (weapons, shields, staves and torches in either hand, or worn armor/ammo). Format: `"modName:formID"` (e.g., `"Skyrim.esm:0xABCDEF"`), `"EditorIDName"` (e.g., `"IronSword"`), or a formlist's formID/editorID.
+
+- **`isEquipNot`**: An array of weapons/armor/other equippable items that the event source actor must *not* currently have equipped or worn. Same format as `isEquip`.
 
 - **`actorKeywords`**: An array of keywords that the event source actor must have in their inventory. Format: `"modName:formID"` (e.g., `"Skyrim.esm:0xABCDEF"`), `"EditorIDName"` (e.g., `"VendorItemFood"`), or a formlist's formID/editorID.
 
@@ -417,6 +478,7 @@ For rules with the `"Hit"` event, additional filters can refine which attacks tr
   - `"ranged"`: Bows and crossbows.
   - `"staff"`: Staves.
   - `"handtohand"`: Unarmed attacks.
+  - `"torch"`: Torch bashes (a torch is a light, not a weapon, so this is a separate type from the melee ones above).
   - `"spell"`: Spells.
   - `"scroll"`: Scrolls.
   - `"shout"`: Shouts. **Note:** All shouts don't work with statics. Those shouts that are pure projectiles (e.g., Unrelenting Force) will work only with `furniture`, `flora`, `doors`, `containers` and `activators`.
@@ -480,7 +542,7 @@ Here are all possible `type` values and their supported fields:
 
 ### Utility Effects
 - **`ExecuteConsoleCommand`**: Executes a console command on nearby actors.
-  - Supported fields: `string`, `chance`, `timer`.
+  - Supported fields: `string`, `radius`, `chance`, `timer`.
  
 - **`ExecuteConsoleCommandOnItem`**: Executes a console command on the target object.
   - Supported fields: `string`, `chance`, `timer`.
@@ -493,6 +555,17 @@ Here are all possible `type` values and their supported fields:
 
 - **`ShowMessageBox`**: Shows a message box with "OK" button.
   - Supported fields: `string`, `chance`, `timer`.
+
+- **`AddBounty`**: Adds bounty to the player's current hold/crime faction.
+  - Supported fields: `count`, `violent`, `chance`, `timer`.
+  - **`count`**: Amount of bounty gold to add.
+  - **`violent`**: Determines which crime-gold category is used:
+    - `0`: stealing like bounty.
+    - `1`: trespassing like  bounty.
+  - The hold/crime faction is resolved automatically from the player's current location.
+  - The effect also attempts to trigger the corresponding native crime/alarm behavior using the rule target as the crime reference when required.
+  - The player remains the crime actor; `AddBounty` does not kill or otherwise alter the target NPC by itself.
+  - A notification is shown using the amount and hold name, for example: `100 bounty added to Whiterun`.
 
 ### Object Management
 - **`RemoveItem`**: Deletes the target object.
@@ -512,6 +585,58 @@ Here are all possible `type` values and their supported fields:
 
 - **`ActivateItem`**: Activates the target object. Behaves the same as pressing `E` for all form types. Does *not* work with the `Activate` event to avoid collisions.
   - No `items` array required.
+ 
+- **`ScaleObject`**: Scales the target object bigger or smaller.
+  - Supported fields: `scale`, `fade`, `relative`, `chance`, `timer`.
+  - **`scale`**: The value to set the target's scale to (e.g., `"scale": 0.5` for half size, `"scale": 2.0` for double size). Accepts the same `{"min": ..., "max": ...}` random format as other effects.
+  - **`relative`**: `false` (default): `scale` sets the target's absolute scale outright. `true`: `scale` is instead a multiplier applied to the target's *current* scale, so repeated hits compound (e.g. `2.0` then `3.0` results in `6.0` total) instead of each one overwriting the last.
+  - **`fade`**: Same meaning as the `spawn`/`swap` `fade` field (see below) - whether the object is allowed to fade in/out from distance/LOD after the scale change's collision refresh. Defaults to `1`.
+  - Values are clamped to a minimum of `0.01`. There is no hard maximum - the engine accepts arbitrarily large scales, the same as the "Scale" field in the Creation Kit, though very large values may look or collide strangely.
+  - If `scale` isn't specified, the target is reset to its normal size (`1.0`) in absolute mode, or left unchanged in relative mode.
+
+- **`RestoreScale`**: Restores the target object to the scale it had *before* the most recent `ScaleObject` call touched it (the "original" scale is recorded automatically the first time `ScaleObject` runs on that reference, and cleared again once `RestoreScale` uses it, so a later `ScaleObject` call starts tracking a fresh baseline).
+  - Supported fields: `fade`, `chance`, `timer`.
+  - If `ScaleObject` was never called on this reference this session (or the game was reloaded since - this tracking is in-memory only, not saved), it falls back to the engine default of `1.0` instead of doing nothing.
+  - No `formID`/`editorID`/`items` needed beyond the optional `fade`/`chance`/`timer` fields - it always restores the target itself.
+
+  Example - hitting an object grows it, activating it puts it back:
+
+  ```json
+  [
+      {
+          "event": ["Hit"],
+          "filter": { "formTypes": ["static"] },
+          "effect": [{ "type": "ScaleObject", "scale": 1.5, "relative": true }]
+      },
+      {
+          "event": ["Activate"],
+          "filter": { "formTypes": ["static"] },
+          "effect": [{ "type": "RestoreScale" }]
+      }
+  ]
+  ```
+
+- **`SwapBaseObject`**: Changes the target reference's base object *in place*, rather than spawning a new reference and deleting the old one the way `SwapItem`/`SwapActor` do. Because the reference itself never changes (only what it's a reference *to*), anything that tracks the object by its RefID - persistent references, quest aliases, other mods/scripts holding a handle to it - keeps working. Conceptually similar to what Base Object Swapper does, but BOS intercepts before a reference's 3D is ever loaded; this instead runs on a reference that's already loaded, so a disable/enable cycle is used to force the engine to rebuild the model/collision from the new base object.
+  - Supported fields: `formID`, `editorID`, `formList`, `fade`, `resetInventory`, `chance`, `timer`.
+  - **`resetInventory`**: `false` (default): the reference's current inventory is kept as-is across the swap. `true`: forwarded to the underlying `Enable()` call as a full inventory reset - matters mainly when swapping to/from a container.
+  - A reference can only have one base object at a time: if `items`/`formList` resolves to more than one entry, only the *first* one is actually applied (a warning is logged) - use a formlist `index` of `-3` (random) or a specific index rather than `-1` ("all") here.
+
+  Example - permanently turn a specific unlit brazier into a lit one the first time it's activated:
+
+  ```json
+  [
+      {
+          "event": ["Activate"],
+          "filter": {
+              "formIDs": ["Skyrim.esm:0x1A3F2"]
+          },
+          "effect": [{
+              "type": "SwapBaseObject",
+              "items": [{"formID": "Skyrim.esm:0x1A3F5"}]
+          }]
+      }
+  ]
+  ```
  
 ### Inventory Management
 - **`SpillInventory`**: Spills the contents of the target container.
@@ -541,6 +666,13 @@ Here are all possible `type` values and their supported fields:
 
 - **`SwapLeveledItem`**: Replaces the target object with a random leveled item (based on the player's level).
   - Supported fields: `formID`, `editorID`, `formList`, `count`, `scale`, `fade`, `spawnType`, `string`, `nonDeletable`, `chance`, `timer`.
+
+- **`DropHarvest`**: For a `Flora` (or a harvestable `Tree`, e.g. a fruit tree) target, drops its produced ingredient/fruit on the ground instead of letting it land in the source actor's inventory.
+  - Supported fields: `count`, `scale`, `fade`, `spawnType`, `chance`, `timer`. No `formID`/`editorID` needed - the item comes from the target itself.
+  - **How it actually works (important):** the game grants a Flora/Tree's item directly into inventory as part of its own native activation handling, and there's no supported way for this framework to intercept and cancel that grant before it happens (the `Activate` event only fires as a notification *after* the native activation already ran). So this effect doesn't prevent the grant - it reverses it immediately afterward (removing exactly what was actually granted, never more than the source actor's current stock) and spawns a physical copy on the ground instead. From the player's perspective this is functionally the same as never having received it, just with a dropped item on the ground in its place.
+  - `count` controls how many copies are dropped on the ground. If omitted, it defaults to `1` - the same amount the vanilla engine always grants per Flora/Tree activation (there's no per-plant "quantity" field; it's always exactly one). Set it explicitly (a fixed number, or `{"min": ..., "max": ...}` for a random amount each trigger, same as other spawn effects) to drop a different number instead.
+  - Only works against a target whose base object actually produces an item (Flora, or a Tree with a configured produce item). Other object types are ignored with a warning.
+  - Typical usage: pair with the `Activate` event and a `formTypes: ["flora"]` (or `["tree"]`) filter.
 
 ### Actor Spawning & Swapping
 - **`SpawnActor`**: Spawns specified actors at the target object's location.
@@ -589,6 +721,67 @@ Here are all possible `type` values and their supported fields:
 - **`RemoveActorPerk`**: Removes specified perks from the source actor (regardless of the perk rank).
   - Supported fields: `formID`, `editorID`, `formList`, `chance`, `timer`.
 
+### Actor Value & Force Effects
+
+Both of these act on every actor within a radius of the effect's center (the impact position when there is one, otherwise the target's or source's position), rather than on a single item/spell form - so instead of `formID`/`editorID`/`formList`, their per-item configuration lives directly in the `items` array's other fields.
+
+- **`modav`**: Directly changes an actor value (health, magicka, stamina, skills, resistances, regen rates, or any other value from the same name list as the `actorValues` filter above) for every actor in range, the same way potions/spells restore or damage a value.
+  - Supported fields: `string`, `amount`, `radius`, `affectSource`, `affectPlayer`, `chance`, `timer`.
+  - **`string`**: The actor value's name (e.g. `"Health"`, `"Stamina"`, `"Magicka"` - any name from the `actorValues` filter's list works here too). Required.
+  - **`amount`**: How much to change it by. Positive restores/adds, negative damages/reduces (and can reduce Health to 0, i.e. kill the actor, exactly like any other damage source). Accepts the usual `{"min": ..., "max": ...}` random format.
+  - **`affectSource`** (default `true`): Whether the actor who caused the hit can be affected if they're in range.
+  - **`affectPlayer`** (default `true`): Whether the player specifically can be affected if in range, independent of whether they're the source.
+
+  Example - a "healing ward" static that restores health to anyone standing near it, but never damages the player:
+
+  ```json
+  [
+      {
+          "event": ["OnUpdate"],
+          "filter": {
+              "formIDs": ["MyMod.esp:0x800"]
+          },
+          "effect": [{
+              "type": "modav",
+              "items": [
+                  { "string": "Health", "amount": 5, "radius": 300 }
+              ]
+          }]
+      }
+  ]
+  ```
+
+- **`ApplyForce`**: Pushes every actor in range directly away from the effect's center - a knockback/shove, written straight into the character controller's velocity the same low-level way vanilla knockback/explosions ultimately work, so it interacts correctly with gravity and collision instead of just teleporting the actor. A modest upward lift is mixed into the push direction so it reads as a shove up-and-away rather than a slide. Actors explicitly flagged non-pushable (bosses, scripted sequences, etc.) are skipped, the same as vanilla knockback effects respect that flag.
+  - Supported fields: `amount`, `radius`, `affectSource`, `affectPlayer`, `chance`, `timer`.
+  - **`amount`**: Push magnitude, in game units/second. Accepts the `{"min": ..., "max": ...}` random format.
+  - **`affectSource`** (default `true`): Whether the actor who caused the hit can be pushed if in range.
+  - **`affectPlayer`** (default `true`): Whether the player specifically can be pushed if in range.
+  
+	Amount	Effect on actor
+	- Below ~30	No visible effect — this is the engine's own force threshold, not a bug
+	- ~150+	A nudge
+	- ~500+	Stagger / knocked down
+	- ~1000+	Actor is properly thrown/launched
+
+  Example - an explosive barrel that also shoves everyone nearby away from it when it's hit:
+
+  ```json
+  [
+      {
+          "event": ["Hit"],
+          "filter": {
+              "formIDs": ["MyMod.esp:0x900"]
+          },
+          "effect": [{
+              "type": "ApplyForce",
+              "items": [
+                  { "amount": 1200, "radius": 400, "affectSource": false }
+              ]
+          }]
+      }
+  ]
+  ```
+
 ### Visual & Audio Effects
 - **`PlaySound`**: Plays a sound descriptor on the target object.
   - Supported fields: `formID`, `editorID`, `formList`, `count`, `chance`, `timer`.
@@ -596,11 +789,19 @@ Here are all possible `type` values and their supported fields:
 - **`PlayIdle`**: Plays an animation on an actor who interacted with the target object. [List of available animation names](https://forums.nexusmods.com/topic/11007808-le-list-of-animation-events-for-debugsendanimationevent/?do=findComment&comment=105617168).
   - Supported fields: `string`, `duration`, `chance`, `timer`.
  
-- **`SpawnImpactDataSet`**: Plays an impact data set on the target object (not to be confused with impacts).
+- **`SpawnImpact`**: Plays a single **Impact** record (IPCT) directly at the hit point - no Impact Data Set and no material lookup. Only the record's effect model is played (its decal and sound are not). The form must be an Impact (IPCT); a form of the wrong type is skipped and a warning is written to the log.
+- **`SpawnImpactDataSet`**: Plays an **Impact Data Set** (IPDS) - the engine picks the impact by the material that is hit. The form must be an Impact Data Set (IPDS), not a single Impact.
   - Supported fields: `formID`, `editorID`, `formList`, `count`, `chance`, `timer`.
 
 - **`SpawnExplosion`**: Triggers an explosion at the target object's location.
   - Supported fields: `formID`, `editorID`, `formList`, `count`, `fade`, `spawnType`, `chance`, `timer`.
+
+- **`SpawnHazard`**: Spawns a hazard at the target object's location. Works with any event.
+  - Supported fields: `formID`, `editorID`, `formList`, `count`, `fade`, `spawnType`, `string`, `duration`, `nonDeletable`, `chance`, `timer`.
+  - **`duration`**: How many real-time seconds the spawned hazard lasts before being automatically disabled and deleted. Defaults to `0`, meaning no automatic removal - the hazard persists according to its own native lifetime instead.
+
+- **`SwapHazard`**: Same as `SpawnHazard`, but also removes/disables the original target object afterward (same `nonDeletable` semantics as other `Swap*` effects - `0` deletes it, `1` only disables it). Unlike `SpawnHazard`, this requires an actual target reference to swap out, so it doesn't work with `"HitGround"`/`"HitWater"`.
+  - Supported fields: `formID`, `editorID`, `formList`, `count`, `fade`, `spawnType`, `string`, `duration`, `nonDeletable`, `chance`, `timer`.
 
 - **`SpawnEffectShader`**: Spawns effect shaders on nearby actors.
   - Supported fields: `formID`, `editorID`, `formList`, `count`, `radius`, `duration`, `chance`, `timer`.
@@ -629,6 +830,29 @@ Here are all possible `type` values and their supported fields:
 
 - **`EnableLight`**: Enables previously disabled lights.
   - Supported fields: `radius`, `chance`, `timer`.
+
+### Weather Effects
+- **`ChangeWeather`**: Forces or transitions to a specific weather.
+  - Supported fields: `formID`, `editorID`, `formList`, `immediate`, `chance`, `timer`.
+  - **`immediate`** (default `false`): `false` uses a normal gradual blend to the new weather (the same as the `sw` console command). `true` snaps to it instantly with no crossfade at all - the very next frame renders fully transitioned (the same as `fw`, but actually instant, unlike `fw` alone).
+  - Works with any event - it doesn't need or use a target object, so it's a good fit for `"OnUpdate"`, `"HitGround"`/`"HitWater"`, or any other target-less trigger.
+
+  Example - force a storm the instant a specific altar is activated:
+
+  ```json
+  [
+      {
+          "event": ["Activate"],
+          "filter": {
+              "formIDs": ["MyMod.esp:0xA00"]
+          },
+          "effect": [{
+              "type": "ChangeWeather",
+              "items": [{"editorID": "SkyrimStormy1", "immediate": true}]
+          }]
+      }
+  ]
+  ```
  
 ---
 
@@ -683,7 +907,7 @@ For effect types that support an `items` array, you can specify detailed configu
   - **`min`**: Minimal random value.
   - **`max`**: Maximal random value.
 
-- **`radius`**: Specifies the radius in game units for effect application (e.g., `"radius": 100.0`). Defaults to `100.0`. 
+- **`radius`**: Specifies the radius in game units for effect application (e.g., `"radius": 100.0`). Defaults to `100.0`. This is an exact 3D sphere around the effect's center point (the impact position, or the target/dummy's position) - an actor well above or below that point is out of range just like one too far away horizontally.
 
   **Optional** detailed entry (e.g., `"radius": {"min": 50.0, "max": 150.0}`):
   - **`min`**: Minimal random value.
@@ -695,7 +919,7 @@ For effect types that support an `items` array, you can specify detailed configu
   - **`min`**: Minimal random value.
   - **`max`**: Maximal random value.
 
-- **`duration`**: For `PlayIdle`, defaults to 1.0 (lower values make animation faster). For **effect shaders** and **art objects**, specifies how long the effect lasts.
+- **`duration`**: For `PlayIdle`, defaults to 1.0 (lower values make animation faster). For **effect shaders** and **art objects**, specifies how long the effect lasts. For **`SpawnHazard`/`SwapHazard`**, how many real-time seconds until the spawned hazard is automatically disabled and deleted; defaults to `0` (no automatic removal - it persists per its own native lifetime instead).
 
 - **`string`**: Used for various effects. Takes one entry. For **spawn** and **swap** effects, used to take node name. For `PlayIdle`, used to take animation name.
 
@@ -711,6 +935,39 @@ For effect types that support an `items` array, you can specify detailed configu
   - `0`: Without fade effect (do **not** use with **explosions**).
   - `1` (default): With fade effect.
 
+- **`relative`**: Used for `ScaleObject` only. `false` (default): `scale` sets the target's absolute scale. `true`: `scale` multiplies the target's *current* scale instead, so repeated hits compound.
+
+- **`resetInventory`**: Used for `SwapBaseObject` only. `false` (default): the reference's inventory is kept as-is across the base object swap. `true`: the inventory is reset as part of the swap - matters mainly when swapping to/from a container.
+
+- **`immediate`**: Used for `ChangeWeather` only. `false` (default): a normal gradual blend to the new weather. `true`: snaps to it instantly with no crossfade.
+
+- **`amount`**: Used for `modav` (how much to change the actor value by - positive restores/adds, negative damages/reduces) and `ApplyForce` (push magnitude, in game units/second). Accepts the same `{"min": ..., "max": ...}` random format as other numeric fields.
+
+- **`affectSource`**: Used for `modav` and `ApplyForce` only. Default `true`. Whether the actor who caused the hit can be affected/pushed if they're within `radius`.
+
+- **`affectPlayer`**: Used for `modav` and `ApplyForce` only. Default `true`. Whether the player specifically can be affected/pushed if within `radius`, independent of whether they're the source.
+
+- **`rank`**: Used for `AddActorPerk` only. The perk rank to add (for ranked perks). Defaults to `1`.
+
+- **`stage`**: An integer, valid on *any* effect entry regardless of type, that makes that specific entry only fire on a particular numbered interaction with the target rather than every time. Each `(source, target, rule)` combination tracks its own ever-increasing "current stage" counter, starting at `1` on the very first successful match and incrementing on every subsequent one (independent of `chance` - a match that loses its chance roll still counts). An effect entry with `"stage": N` only fires while that counter equals `N`; an entry with no `stage` (or `"stage": 0`, the default) always fires regardless of the counter. This lets a single rule sequence *different* effects across successive interactions without earlier stages re-firing - e.g. "1st hit does X, 2nd hit does Y" instead of X firing on every hit.
+
+  Example - a shrine that heals a little on the first hit, then breaks (and stops healing) on the second:
+
+  ```json
+  [
+      {
+          "event": ["Hit"],
+          "filter": { "formIDs": ["MyMod.esp:0xB00"] },
+          "effect": [
+              { "type": "modav", "stage": 1, "items": [{ "string": "Health", "amount": 25, "radius": 150 }] },
+              { "type": "SwapItem", "stage": 2, "items": [{"formID": "MyMod.esp:0xB01"}] }
+          ]
+      }
+  ]
+  ```
+
+  The stage counter never resets or loops back on its own - once it advances past the highest `stage` used in a rule, only `stage: 0` (unstaged) entries keep firing on later interactions.
+
 - **`spawnType`**: Used for `spawn`/`swap` functions only. Allows you to select the type of how the object should be spawned. Options:
   - `0`: Common PlaceAtMe().
   - `1`: PlaceAtMe() spawning the object at the center of the original.
@@ -722,10 +979,18 @@ For effect types that support an `items` array, you can specify detailed configu
   - `7`: Bypass with spawning at the bottom of the original.
   - `8`: Pin to the ground regardless of the landing location (e.g., when used with `Throw`, an object that lands on the wall will spawn a new one directly beneath it on the floor).
   - `9`: Pin to the specified node. Requires a node name or it's substring to be passed in `string`.
+  - `10`: Bypass with a random horizontal offset around the original. Radius (in game units) is passed in `string` as a number (e.g. `"128"`); defaults to `64` if `string` is empty or not a number.
+  - `11`: Bypass, spawning exactly at the projectile's impact point instead of the target's origin. Only meaningful for hits caused by a projectile (arrows, spells, thrown weapons); melee/magic-effect hits carry no such point and fall back to the center of the original, same as `5`.
+  - `12`: Bypass, spawning in front of the original along its current facing. Distance (in game units) is passed in `string` as a number (e.g. `"80"`); defaults to `50` if `string` is empty or not a number. A negative value spawns behind the original instead.
+  - `13`: Bypass, spawning at the position of the actor who caused the hit (the attacker/thrower) rather than at the target. Falls back to the target's own position if there is no such actor (e.g. a scripted/trap-triggered event).
+  - `14`: Bypass, spawning at a fixed vertical offset from the target. Offset (in game units) is passed in `string` as a number (e.g. `"75"`); defaults to `50` (above) if `string` is empty or not a number. A negative value spawns below the target instead - see the note below on how this interacts with the ground safety net.
+
+  **Every spawnType (`0`-`14`) is also passed through a ground safety net**: after its own position logic runs, if the resulting spot would end up below the actual terrain surface at that (x, y), it's raised back up to just above it. This only ever raises the position, never lowers it, and only applies outdoors, where there's a terrain surface to check against - indoor positions (floors, shelves, etc.) are never touched. This means a negative `14` offset ("below target") is only useful for a target that is itself above the ground (e.g. spawning underneath something hanging or floating); it will not dig an object into solid terrain.
 
   **NOTE**: If you want to spawn **explosions**, use `0` or `4` only.
 
 ---
+
 
 ## Examples
 
@@ -924,3 +1189,61 @@ For effect types that support an `items` array, you can specify detailed configu
     ]
     ```
     - Activating an ingredient applies its effects to actors within 300 units with 75% chance.
+
+11. **Require a Specific Weapon Equipped**
+    ```json
+    [
+        {
+            "event": ["Hit"],
+            "filter": {
+                "formTypes": ["static"],
+                "isEquip": ["Skyrim.esm:0x13994"],
+                "isEquipNot": ["Skyrim.esm:0x139B7"]
+            },
+            "effect": [{
+                "type": "SpawnExplosion",
+                "items": [{"formID": "Skyrim.esm:0x123456"}]
+            }]
+        }
+    ]
+    ```
+    - Hitting a static object only triggers the explosion if the source actor has a specific weapon (`0x13994`) equipped and does *not* have another one (`0x139B7`) equipped - e.g. a "special hammer breaks rocks, but not while a shield is also equipped" setup.
+
+12. **Harvest a Plant onto the Ground Instead of Into Inventory**
+    ```json
+    [
+        {
+            "event": ["Activate"],
+            "filter": {
+                "formTypes": ["flora"]
+            },
+            "effect": [{
+                "type": "DropHarvest",
+                "items": [{"scale": 1.2}]
+            }]
+        }
+    ]
+    ```
+    - Activating a flora reverses the ingredient it normally grants to inventory and instead drops one copy of it on the ground (matching what the plant actually grants) at 1.2x scale. Add `"count": N` to drop a different number instead.
+13. **Add a Non-Violent Bounty**
+```json
+[
+    {
+        "event": ["Activate"],
+        "filter": {
+            "formTypes": ["container"]
+        },
+        "effect": [{
+            "type": "AddBounty",
+            "count": 100,
+            "violent": 0
+        }]
+    }
+]
+```
+
+This adds 100 non-violent bounty gold to the player's current hold.
+
+> **Note:** `violent` only controls the bounty/crime category. The actual alarm behavior depends on the target reference and the Skyrim crime system.
+
+---
