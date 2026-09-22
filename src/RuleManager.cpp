@@ -1,5 +1,6 @@
 #include "RuleManager.h"
 #include "Effects.h"
+#include "RE/E/ExtraOwnership.h"
 #include <nlohmann/json.hpp>
 
 namespace fs = std::filesystem;
@@ -87,7 +88,7 @@ namespace OIF {
     static std::string MapWeaponTypeToString(std::string_view s) {
         static const std::unordered_set<std::string_view> validWeaponTypes = {
             "onehandsword", "twohandsword", "onehandaxe", "twohandaxe",
-            "onehandmace", "twohandmace", "dagger", "ranged", "staff",
+            "onehandmace", "twohandmace", "dagger", "ranged", "staff", "torch",
             "spell", "scroll", "shout", "ability", "lesserpower", "power",
             "explosion", "handtohand", "total"
         };
@@ -346,6 +347,68 @@ namespace OIF {
         return typedForm;
     }
 
+    // Reads a form's EditorID even for types the vanilla TESForm::GetFormEditorID() doesn't
+    // support (Sound Descriptors among them - Bethesda's engine only keeps EditorIDs in memory
+    // for a small fixed set of form types). Mirrors powerofthree's CLibUtil editorID.hpp:
+    // natively-supported types go through the normal virtual call; anything else is resolved
+    // via po3 Tweaks' own exported GetFormEditorID(FormID) when that plugin is loaded. This
+    // crosses the DLL boundary with a plain FormID in and a raw const char* out - no STL
+    // objects are passed by value across the boundary, so it's ABI-safe regardless of what
+    // compiler/STL settings po3_Tweaks.dll itself was built with.
+    static std::string GetFormEditorIDCompat(RE::TESForm* form) {
+        if (!form) return {};
+
+        switch (form->GetFormType()) {
+        case RE::FormType::Keyword:
+        case RE::FormType::LocationRefType:
+        case RE::FormType::Action:
+        case RE::FormType::MenuIcon:
+        case RE::FormType::Global:
+        case RE::FormType::HeadPart:
+        case RE::FormType::Race:
+        case RE::FormType::Sound:
+        case RE::FormType::Script:
+        case RE::FormType::Navigation:
+        case RE::FormType::Cell:
+        case RE::FormType::WorldSpace:
+        case RE::FormType::Land:
+        case RE::FormType::NavMesh:
+        case RE::FormType::Dialogue:
+        case RE::FormType::Quest:
+        case RE::FormType::Idle:
+        case RE::FormType::AnimatedObject:
+        case RE::FormType::ImageAdapter:
+        case RE::FormType::VoiceType:
+        case RE::FormType::Ragdoll:
+        case RE::FormType::DefaultObject:
+        case RE::FormType::MusicType:
+        case RE::FormType::StoryManagerBranchNode:
+        case RE::FormType::StoryManagerQuestNode:
+        case RE::FormType::StoryManagerEventNode:
+        {
+            const char* eid = form->GetFormEditorID();
+            return eid ? eid : std::string{};
+        }
+        default:
+        {
+            using _GetFormEditorID = const char* (*)(std::uint32_t);
+            static _GetFormEditorID po3GetFormEditorID = []() -> _GetFormEditorID {
+                if (HMODULE tweaks = GetModuleHandleW(L"po3_Tweaks.dll")) {
+                    return reinterpret_cast<_GetFormEditorID>(GetProcAddress(tweaks, "GetFormEditorID"));
+                }
+                return nullptr;
+            }();
+
+            if (po3GetFormEditorID) {
+                if (const char* eid = po3GetFormEditorID(form->GetFormID()); eid && eid[0] != '\0') {
+                    return eid;
+                }
+            }
+            return {};
+        }
+        }
+    }
+
     template <class T>
     T* RuleManager::GetFormFromEditorID(const std::string& editorID) {
         if (editorID.empty()) {
@@ -366,8 +429,9 @@ namespace OIF {
         }
 
         for (auto& formPtr : dh->GetFormArray<T>()) {
-            if (formPtr && formPtr->GetFormEditorID() &&
-                _stricmp(formPtr->GetFormEditorID(), editorID.c_str()) == 0) {
+            if (!formPtr) continue;
+            std::string eid = GetFormEditorIDCompat(formPtr);
+            if (!eid.empty() && _stricmp(eid.c_str(), editorID.c_str()) == 0) {
                 return formPtr;
             }
         }
@@ -398,7 +462,52 @@ namespace OIF {
         }
         return false;
     }
+
+	// Checks whether the actor currently has the given item equipped/worn -
+	// weapons, shields, staves and torches in either hand via GetEquippedObject,
+	// and armor/ammo/other worn items via the inventory entry's "worn" extra data
+	// (the same check the game itself uses to know what's currently on the actor).
+	bool IsEquipped(RE::Actor* actor, RE::FormID formID) {
+		if (!actor) return false;
+
+		if (auto* rightObj = actor->GetEquippedObject(false)) {
+			if (rightObj->GetFormID() == formID) return true;
+		}
+		if (auto* leftObj = actor->GetEquippedObject(true)) {
+			if (leftObj->GetFormID() == formID) return true;
+		}
+
+		auto inventory = actor->GetInventory();
+		for (const auto& [item, invData] : inventory) {
+			if (!item || item->GetFormID() != formID) continue;
+			if (invData.first <= 0) continue;
+			if (invData.second && invData.second->IsWorn()) return true;
+		}
+
+		return false;
+	}
     
+    // Counts how many words of the given shout are currently unlocked ("known").
+    // NOTE: Word-of-power knowledge is a native, generic TESForm record flag (RecordFlags::kKnown,
+    // the same flag reused for "book read", "recipe known", etc. across other form types), so this
+    // reads it directly off each TESWordOfPower rather than going through Actor - shout word unlocks
+    // are a player-only mechanic in vanilla, so this is only meaningful for the player character.
+    // The `variations` array and `word` member names below are inferred from the shout's known Variation
+    // fields (`spell`, `recoveryTime`, confirmed via CommonLibSSE-NG docs) and the legacy SKSE
+    // Shout.GetNthWordOfPower/SetNthWordOfPower pattern; verify these two names against the actual
+    // vendored CommonLibSSE-NG header if this fails to compile.
+    std::uint32_t CountKnownShoutWords(RE::TESShout* shout) {
+        if (!shout) return 0;
+
+        std::uint32_t known = 0;
+        for (const auto& variation : shout->variations) {
+            if (variation.word && (variation.word->GetFormFlags() & RE::TESForm::RecordFlags::kKnown) != 0) {
+                ++known;
+            }
+        }
+        return known;
+    }
+
     std::uint32_t GetQuestItemStatus(RE::TESObjectREFR* ref) {
         if (!ref) return 0;
 
@@ -520,15 +629,27 @@ namespace OIF {
 	bool CheckLocationFilter(const Filter& f, const RuleContext& ctx)
 	{
 		// If there are no filters - skip the check
-		if (f.locations.empty() && f.locationsNot.empty()) return true;
+		if (f.locations.empty() && f.locationsNot.empty() &&
+			f.locationKeywords.empty() && f.locationKeywordsNot.empty()) return true;
 
-		auto* target = ctx.target->As<RE::TESObjectREFR>();
+		// Ground hits (kHitGround) have no reference target - RE::TESObjectLAND
+		// terrain isn't a TESObjectREFR. Fall back to the source actor's own
+		// location/cell/worldspace, which is where the impact actually happened.
+		auto* target = ctx.target ? ctx.target->As<RE::TESObjectREFR>() : (ctx.source ? ctx.source->As<RE::TESObjectREFR>() : nullptr);
 		if (!target) return false;  // If target is not a valid reference, make sure Trigger is not executed
 
 		auto* currentCell = target->GetParentCell();
 		RE::FormID currentCellID = currentCell ? currentCell->GetFormID() : 0;
 
+		// TESObjectREFR::GetCurrentLocation() is reliably populated for actively-tracked actors
+		// (the player, NPCs) but is typically null for static objects like activators, items, or
+		// furniture - which is what ctx.target usually is. Fall back to the parent cell's own
+		// location, which is data set on the cell itself and doesn't depend on per-reference
+		// location tracking.
 		auto* currentLocation = target->GetCurrentLocation();
+		if (!currentLocation && currentCell) {
+			currentLocation = currentCell->GetLocation();
+		}
 		RE::FormID currentLocationID = currentLocation ? currentLocation->GetFormID() : 0;
 
 		auto* currentWorldspace = target->GetWorldspace();
@@ -537,11 +658,14 @@ namespace OIF {
 		}
 		RE::FormID currentWorldspaceID = currentWorldspace ? currentWorldspace->GetFormID() : 0;
 
-		// Collect all parent locations
+		// Collect all parent locations (both FormIDs, for the locations/locationsNot filters,
+		// and the location pointers themselves, for the keyword-based filters below).
 		std::set<RE::FormID> currentlocations;
+		std::vector<RE::BGSLocation*> locationChain;
 		std::set<RE::FormID> visitedParents;
 		if (currentLocation) {
 			currentlocations.insert(currentLocationID);
+			locationChain.push_back(currentLocation);
 			auto* parentLoc = currentLocation;
 			while (parentLoc && parentLoc->parentLoc) {
 				parentLoc = parentLoc->parentLoc;
@@ -551,6 +675,7 @@ namespace OIF {
 				}
 				visitedParents.insert(parentLoc->GetFormID());
 				currentlocations.insert(parentLoc->GetFormID());
+				locationChain.push_back(parentLoc);
 			}
 		}
 
@@ -590,6 +715,64 @@ namespace OIF {
 			if (excluded) return false;
 		}
 
+		// Check location keyword filters - matches if the current location or ANY of its
+		// parent locations (e.g. a city district's parent city, or a Hold) has the keyword.
+		// A missing location (e.g. wilderness with no defined Location record) never matches
+		// "locationkeywords" and never triggers "locationkeywordsnot".
+		if (!f.locationKeywords.empty()) {
+			if (locationChain.empty()) {
+				logger::info("locationkeywords: no location could be resolved for target 0x{:08X} (cell 0x{:08X} / {})", target->GetFormID(), currentCellID, currentCell && currentCell->GetFormEditorID() && currentCell->GetFormEditorID()[0] ? currentCell->GetFormEditorID() : "no cell editorID");
+			} else {
+				std::string chainDesc;
+				for (auto* loc : locationChain) {
+					if (!loc) continue;
+					if (!chainDesc.empty()) chainDesc += " -> ";
+					const char* eid = loc->GetFormEditorID();
+					if (eid && eid[0] != '\0') {
+						chainDesc += std::format("{} (0x{:08X})", eid, loc->GetFormID());
+					} else {
+						chainDesc += std::format("<no editorID> (0x{:08X})", loc->GetFormID());
+					}
+				}
+				logger::info("locationkeywords: resolved location chain for target 0x{:08X} (cell 0x{:08X} / {}): {}", target->GetFormID(), currentCellID, currentCell && currentCell->GetFormEditorID() && currentCell->GetFormEditorID()[0] ? currentCell->GetFormEditorID() : "no cell editorID", chainDesc);
+			}
+
+			bool matched = false;
+			for (auto* loc : locationChain) {
+				if (!loc) continue;
+
+				std::string kwList;
+				for (auto& kwData : loc->keywordData) {
+					if (!kwData.keyword) continue;
+					if (!kwList.empty()) kwList += ", ";
+					const char* kwEid = kwData.keyword->GetFormEditorID();
+					kwList += (kwEid && kwEid[0]) ? kwEid : std::format("0x{:08X}", kwData.keyword->GetFormID());
+				}
+				logger::info("locationkeywords: location 0x{:08X} has keywords: [{}]", loc->GetFormID(), kwList.empty() ? "none" : kwList);
+
+				for (auto* kw : f.locationKeywords) {
+					if (kw && loc->HasKeyword(kw)) {
+						matched = true;
+						break;
+					}
+				}
+				if (matched) break;
+			}
+			if (!matched) {
+				logger::info("locationkeywords: no location in the chain has any of the required keywords");
+				return false;
+			}
+		}
+
+		if (!f.locationKeywordsNot.empty()) {
+			for (auto* loc : locationChain) {
+				if (!loc) continue;
+				for (auto* kw : f.locationKeywordsNot) {
+					if (kw && loc->HasKeyword(kw)) return false;
+				}
+			}
+		}
+
 		return true;
 	}
     
@@ -627,6 +810,7 @@ namespace OIF {
         std::unique_lock lock(_ruleMutex);
         _limitCounts.clear();
         _interactionsCounts.clear();
+        _stageCounts.clear();
     }
     
     void RuleManager::OnSave(SKSE::SerializationInterface* intf)
@@ -640,6 +824,20 @@ namespace OIF {
         intf->WriteRecordData(limitSize);
     
         for (auto& [key, val] : _limitCounts) {
+            intf->WriteRecordData(&key, sizeof(key));
+            intf->WriteRecordData(&val, sizeof(val));
+        }
+
+        // Separate record for stage counts (see Effect::atStage) - persisted the same way
+        // and for the same reason as limit counts: a staged effect sequence shouldn't be
+        // resettable just by reloading a save.
+        if (!intf->OpenRecord('SCNT', 1)) // 'SCNT' for Stage Counts
+            return;
+
+        std::uint32_t stageSize = static_cast<std::uint32_t>(_stageCounts.size());
+        intf->WriteRecordData(stageSize);
+
+        for (auto& [key, val] : _stageCounts) {
             intf->WriteRecordData(&key, sizeof(key));
             intf->WriteRecordData(&val, sizeof(val));
         }
@@ -659,6 +857,15 @@ namespace OIF {
                     intf->ReadRecordData(&key, sizeof(key));
                     intf->ReadRecordData(&val, sizeof(val));
                     _limitCounts[key] = val;
+                }
+            } else if (type == 'SCNT') {
+                std::uint32_t size;
+                intf->ReadRecordData(size);
+                for (std::uint32_t i = 0; i < size; ++i) {
+                    Key key; std::uint32_t val;
+                    intf->ReadRecordData(&key, sizeof(key));
+                    intf->ReadRecordData(&val, sizeof(val));
+                    _stageCounts[key] = val;
                 }
             }
         }
@@ -797,6 +1004,8 @@ namespace OIF {
                 else if (evLower == "onupdate") r.events.push_back(EventType::kOnUpdate);
                 else if (evLower == "destructionstagechange") r.events.push_back(EventType::kDestructionStageChange);
 				//else if (evLower == "drop") r.events.push_back(EventType::kDrop);
+                else if (evLower == "hitground") r.events.push_back(EventType::kHitGround);
+                else if (evLower == "hitwater") r.events.push_back(EventType::kHitWater);
                 else logger::warn("Unknown event '{}' in {}", ev, path.string());
             }
 
@@ -1013,6 +1222,34 @@ namespace OIF {
                                 r.filter.formIDsNot.insert(form->GetFormID());
                             } else {
                                 logger::warn("Invalid formID '{}' in formidsnot filter of {}", bid.get<std::string>(), path.string());
+                            }
+                        }
+                    }
+                }
+
+                if (jf.contains("references") && jf["references"].is_array()) {
+                    for (auto const& rid : jf["references"]) {
+                        if (rid.is_string()) {
+                            if (auto* form = GetFormFromIdentifier<RE::TESForm>(rid.get<std::string>())) {
+                                r.filter.references.insert(form->GetFormID());
+                            } else {
+                                logger::warn("Invalid reference formID '{}' in references filter of {}", rid.get<std::string>(), path.string());
+                            }
+                        }
+                    }
+
+                    if (!r.filter.references.empty()) {
+                        hasObjectIdentifier = true;
+                    }
+                }
+
+                if (jf.contains("referencesnot") && jf["referencesnot"].is_array()) {
+                    for (auto const& rid : jf["referencesnot"]) {
+                        if (rid.is_string()) {
+                            if (auto* form = GetFormFromIdentifier<RE::TESForm>(rid.get<std::string>())) {
+                                r.filter.referencesNot.insert(form->GetFormID());
+                            } else {
+                                logger::warn("Invalid reference formID '{}' in referencesnot filter of {}", rid.get<std::string>(), path.string());
                             }
                         }
                     }
@@ -1587,6 +1824,85 @@ namespace OIF {
                     }
                 }
                 
+                if (jf.contains("locationkeywords") && jf["locationkeywords"].is_array()) {
+                    for (auto const& kwEntry : jf["locationkeywords"]) {
+                        if (kwEntry.is_string()) {
+                            std::string kwStr = kwEntry.get<std::string>();
+                            RE::TESForm* form = nullptr;
+
+                            if (kwStr.find(':') != std::string::npos) {
+                                form = GetFormFromIdentifier<RE::TESForm>(kwStr);
+                            } else {
+                                form = GetFormFromEditorID<RE::BGSKeyword>(kwStr);
+                                if (!form) {
+                                    form = GetFormFromEditorID<RE::BGSListForm>(kwStr);
+                                }
+                                if (!form) {
+                                    form = GetFormFromEditorID<RE::TESForm>(kwStr);
+                                }
+                            }
+
+                            if (form) {
+                                if (auto* kw = form->As<RE::BGSKeyword>()) {
+                                    r.filter.locationKeywords.insert(kw);
+                                    logger::info("locationkeywords: resolved '{}' to keyword 0x{:08X} in {}", kwStr, kw->GetFormID(), path.string());
+                                } else if (auto* formList = form->As<RE::BGSListForm>()) {
+                                    for (auto* el : formList->forms) {
+                                        if (el) {
+                                            if (auto* listKw = el->As<RE::BGSKeyword>()) {
+                                                r.filter.locationKeywords.insert(listKw);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    logger::warn("Invalid keyword form '{}' (not Keyword or FormList) in locationkeywords filter of {}", kwStr, path.string());
+                                }
+                            } else {
+                                logger::warn("Keyword not found: '{}' in locationkeywords filter of {}", kwStr, path.string());
+                            }
+                        }
+                    }
+                }
+
+                if (jf.contains("locationkeywordsnot") && jf["locationkeywordsnot"].is_array()) {
+                    for (auto const& kwEntry : jf["locationkeywordsnot"]) {
+                        if (kwEntry.is_string()) {
+                            std::string kwStr = kwEntry.get<std::string>();
+                            RE::TESForm* form = nullptr;
+
+                            if (kwStr.find(':') != std::string::npos) {
+                                form = GetFormFromIdentifier<RE::TESForm>(kwStr);
+                            } else {
+                                form = GetFormFromEditorID<RE::BGSKeyword>(kwStr);
+                                if (!form) {
+                                    form = GetFormFromEditorID<RE::BGSListForm>(kwStr);
+                                }
+                                if (!form) {
+                                    form = GetFormFromEditorID<RE::TESForm>(kwStr);
+                                }
+                            }
+
+                            if (form) {
+                                if (auto* kw = form->As<RE::BGSKeyword>()) {
+                                    r.filter.locationKeywordsNot.insert(kw);
+                                } else if (auto* formList = form->As<RE::BGSListForm>()) {
+                                    for (auto* el : formList->forms) {
+                                        if (el) {
+                                            if (auto* listKw = el->As<RE::BGSKeyword>()) {
+                                                r.filter.locationKeywordsNot.insert(listKw);
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    logger::warn("Invalid keyword form '{}' (not Keyword or FormList) in locationkeywordsnot filter of {}", kwStr, path.string());
+                                }
+                            } else {
+                                logger::warn("Keyword not found: '{}' in locationkeywordsnot filter of {}", kwStr, path.string());
+                            }
+                        }
+                    }
+                }
+
                 if (jf.contains("weathers") && jf["weathers"].is_array()) {
                     for (auto const& weather : jf["weathers"]) {
                         if (weather.is_string()) {
@@ -1781,6 +2097,101 @@ namespace OIF {
                     }
                 }
 
+                if (jf.contains("shouts") && jf["shouts"].is_array()) {
+                    for (const auto& shout : jf["shouts"]) {
+                        if (shout.is_string()) {
+                            auto shoutStr = shout.get<std::string>();
+                            RE::TESForm* form = nullptr;
+                            
+                            if (shoutStr.find(':') != std::string::npos) {
+                                form = GetFormFromIdentifier<RE::TESForm>(shoutStr);
+                            } else {
+                                form = GetFormFromEditorID<RE::TESForm>(shoutStr);
+                            }
+                            
+                            if (form) {
+                                if (auto* shoutForm = form->As<RE::TESShout>()) {
+                                    r.filter.shouts.insert(shoutForm->GetFormID());
+                                } else if (auto* formList = form->As<RE::BGSListForm>()) {
+                                    for (auto* el : formList->forms) {
+                                        if (el) {
+                                            if (auto* listShout = el->As<RE::TESShout>()) {
+                                                r.filter.shouts.insert(listShout->GetFormID());
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    logger::warn("Invalid shouts form '{}' (not Shout or FormList) in shouts filter of {}", shoutStr, path.string());
+                                }
+                            } else {
+                                logger::warn("Invalid shouts identifier '{}' in shouts filter of {}", shoutStr, path.string());
+                            }
+                        }
+                    }
+                }
+
+                if (jf.contains("shoutsnot") && jf["shoutsnot"].is_array()) {
+                    for (const auto& shout : jf["shoutsnot"]) {
+                        if (shout.is_string()) {
+                            auto shoutStr = shout.get<std::string>();
+                            RE::TESForm* form = nullptr;
+                            
+                            if (shoutStr.find(':') != std::string::npos) {
+                                form = GetFormFromIdentifier<RE::TESForm>(shoutStr);
+                            } else {
+                                form = GetFormFromEditorID<RE::TESForm>(shoutStr);
+                            }
+                            
+                            if (form) {
+                                if (auto* shoutForm = form->As<RE::TESShout>()) {
+                                    r.filter.shoutsNot.insert(shoutForm->GetFormID());
+                                } else if (auto* formList = form->As<RE::BGSListForm>()) {
+                                    for (auto* el : formList->forms) {
+                                        if (el) {
+                                            if (auto* listShout = el->As<RE::TESShout>()) {
+                                                r.filter.shoutsNot.insert(listShout->GetFormID());
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    logger::warn("Invalid shoutsnot form '{}' (not Shout or FormList) in shoutsnot filter of {}", shoutStr, path.string());
+                                }
+                            } else {
+                                logger::warn("Invalid shoutsnot identifier '{}' in shoutsnot filter of {}", shoutStr, path.string());
+                            }
+                        }
+                    }
+                }
+
+                if (jf.contains("shoutwordsknown") && jf["shoutwordsknown"].is_array()) {
+                    for (const auto& entry : jf["shoutwordsknown"]) {
+                        if (entry.is_object() && entry.contains("shout") && entry["shout"].is_string()) {
+                            auto shoutStr = entry["shout"].get<std::string>();
+                            RE::TESForm* form = nullptr;
+
+                            if (shoutStr.find(':') != std::string::npos) {
+                                form = GetFormFromIdentifier<RE::TESForm>(shoutStr);
+                            } else {
+                                form = GetFormFromEditorID<RE::TESForm>(shoutStr);
+                            }
+
+                            if (form) {
+                                if (auto* shoutForm = form->As<RE::TESShout>()) {
+                                    ShoutWordsCondition cond;
+                                    cond.shoutID = shoutForm->GetFormID();
+                                    cond.minWords = entry.contains("minwords") ? entry["minwords"].get<std::uint32_t>() : 1;
+                                    cond.maxWords = entry.contains("maxwords") ? entry["maxwords"].get<std::uint32_t>() : 3;
+                                    r.filter.shoutWordsKnown.push_back(cond);
+                                } else {
+                                    logger::warn("Invalid shout form '{}' (not a Shout) in shoutwordsknown filter of {}", shoutStr, path.string());
+                                }
+                            } else {
+                                logger::warn("Invalid shout identifier '{}' in shoutwordsknown filter of {}", shoutStr, path.string());
+                            }
+                        }
+                    }
+                }
+
                 if (jf.contains("hasitem") && jf["hasitem"].is_array()) {
                     for (auto const& item : jf["hasitem"]) {
                         if (item.is_string()) {
@@ -1834,6 +2245,64 @@ namespace OIF {
                                 }
                             } else {
                                 logger::warn("Invalid hasitemnot identifier '{}' in hasitemnot filter of {}", itemStr, path.string());
+                            }
+                        }
+                    }
+                }
+                
+                if (jf.contains("isequip") && jf["isequip"].is_array()) {
+                    for (auto const& item : jf["isequip"]) {
+                        if (item.is_string()) {
+                            std::string itemStr = item.get<std::string>();
+                            RE::TESForm* form = nullptr;
+
+                            if (itemStr.find(':') != std::string::npos) {
+                                form = GetFormFromIdentifier<RE::TESForm>(itemStr);
+                            } else {
+                                form = GetFormFromEditorID<RE::TESForm>(itemStr);
+                            }
+
+                            if (form) {
+                                if (auto* formList = form->As<RE::BGSListForm>()) {
+                                    for (auto* el : formList->forms) {
+                                        if (el) {
+                                            r.filter.isEquip.insert(el->GetFormID());
+                                        }
+                                    }
+                                } else {
+                                    r.filter.isEquip.insert(form->GetFormID());
+                                }
+                            } else {
+                                logger::warn("Invalid isequip identifier '{}' in isequip filter of {}", itemStr, path.string());
+                            }
+                        }
+                    }
+                }
+
+                if (jf.contains("isequipnot") && jf["isequipnot"].is_array()) {
+                    for (auto const& item : jf["isequipnot"]) {
+                        if (item.is_string()) {
+                            std::string itemStr = item.get<std::string>();
+                            RE::TESForm* form = nullptr;
+
+                            if (itemStr.find(':') != std::string::npos) {
+                                form = GetFormFromIdentifier<RE::TESForm>(itemStr);
+                            } else {
+                                form = GetFormFromEditorID<RE::TESForm>(itemStr);
+                            }
+
+                            if (form) {
+                                if (auto* formList = form->As<RE::BGSListForm>()) {
+                                    for (auto* el : formList->forms) {
+                                        if (el) {
+                                            r.filter.isEquipNot.insert(el->GetFormID());
+                                        }
+                                    }
+                                } else {
+                                    r.filter.isEquipNot.insert(form->GetFormID());
+                                }
+                            } else {
+                                logger::warn("Invalid isequipnot identifier '{}' in isequipnot filter of {}", itemStr, path.string());
                             }
                         }
                     }
@@ -2481,6 +2950,14 @@ namespace OIF {
 					}
 				}
 
+				if (jf.contains("isteleportdoor") && jf["isteleportdoor"].is_number_unsigned()) {
+					try {
+						r.filter.isTeleportDoor = jf["isteleportdoor"].get<std::uint32_t>();
+					} catch (const std::exception& e) {
+						logger::warn("Invalid isteleportdoor value in isteleportdoor filter of {}: {}", path.string(), e.what());
+					}
+				}
+
 				if (jf.contains("position") && jf["position"].is_number_unsigned()) {
 					try {
 						r.filter.position = jf["position"].get<std::uint32_t>();
@@ -2489,24 +2966,60 @@ namespace OIF {
 					}
 				}
 
-				if (jf.contains("isFirstPerson") && jf["isFirstPerson"].is_number_unsigned()) {
+				if (jf.contains("isinwater") && jf["isinwater"].is_number_unsigned()) {
 					try {
-						r.filter.isFirstPerson = jf["isFirstPerson"].get<std::uint32_t>();
+						r.filter.isInWater = jf["isinwater"].get<std::uint32_t>();
+					} catch (const std::exception& e) {
+						logger::warn("Invalid isinwater value in isinwater filter of {}: {}", path.string(), e.what());
+					}
+				}
+
+				if (jf.contains("materials") && jf["materials"].is_array()) {
+					for (auto const& m : jf["materials"]) {
+						if (m.is_string()) {
+							r.filter.materials.insert(tolower_str(m.get<std::string>()));
+						} else {
+							logger::warn("Invalid material '{}' in materials filter of {}", m.dump(), path.string());
+						}
+					}
+				}
+
+				if (jf.contains("materialsnot") && jf["materialsnot"].is_array()) {
+					for (auto const& m : jf["materialsnot"]) {
+						if (m.is_string()) {
+							r.filter.materialsNot.insert(tolower_str(m.get<std::string>()));
+						} else {
+							logger::warn("Invalid material '{}' in materialsnot filter of {}", m.dump(), path.string());
+						}
+					}
+				}
+
+				if (jf.contains("isfirstperson") && jf["isfirstperson"].is_number_unsigned()) {
+					try {
+						r.filter.isFirstPerson = jf["isfirstperson"].get<std::uint32_t>();
 					} catch (const std::exception& e) {
 						logger::warn("Invalid isFirstPerson value in isFirstPerson filter of {}: {}", path.string(), e.what());
 					}
 				}
 
-				if (jf.contains("isThirdPerson") && jf["isThirdPerson"].is_number_unsigned()) {
+				if (jf.contains("isthirdperson") && jf["isthirdperson"].is_number_unsigned()) {
 					try {
-						r.filter.isThirdPerson = jf["isThirdPerson"].get<std::uint32_t>();
+						r.filter.isThirdPerson = jf["isthirdperson"].get<std::uint32_t>();
 					} catch (const std::exception& e) {
 						logger::warn("Invalid isThirdPerson value in isThirdPerson filter of {}: {}", path.string(), e.what());
 					}
 				}
             }           
 
-            if (!hasObjectIdentifier) {
+            // Ground/water hits (kHitGround/kHitWater) have no target reference by
+            // design - RE::TESObjectLAND terrain and water planes aren't TESObjectREFRs,
+            // so there's nothing for formTypes/formIDs/formLists/keywords to match
+            // against. Rules using either event are exempt from the "must have an
+            // object identifier" requirement below.
+            bool isGroundHitRule = std::find(r.events.begin(), r.events.end(), EventType::kHitGround) != r.events.end()
+                || std::find(r.events.begin(), r.events.end(), EventType::kHitWater) != r.events.end();
+
+            if (!hasObjectIdentifier && !isGroundHitRule) {
                 logger::warn("Skipping rule in {}: no valid object identifiers (formTypes, formIDs, editorIDs, formLists, or keywords)", path.string());
                 continue;
             }
@@ -2540,7 +3053,8 @@ namespace OIF {
                 {"spawnspellonitem", EffectType::kSpawnSpellOnItem},
 				{"applyspell", EffectType::kApplySpell},
                 {"spawnactor", EffectType::kSpawnActor},
-                {"spawnimpactdataset", EffectType::kSpawnImpactDataSet},
+                {"spawnimpact", EffectType::kSpawnImpact},                // a single Impact record (IPCT)
+                {"spawnimpactdataset", EffectType::kSpawnImpactDataSet},  // an Impact Data Set (IPDS)
                 {"spawnexplosion", EffectType::kSpawnExplosion},
                 {"swapitem", EffectType::kSwapItem},
                 {"playsound", EffectType::kPlaySound},
@@ -2580,7 +3094,17 @@ namespace OIF {
                 {"executeconsolecommandonitem", EffectType::kExecuteConsoleCommandOnItem},
 				{"executeconsolecommandonsource", EffectType::kExecuteConsoleCommandOnSource},
                 {"shownotification", EffectType::kShowNotification},
-                {"showmessagebox", EffectType::kShowMessageBox}
+                {"showmessagebox", EffectType::kShowMessageBox},
+                {"addbounty", EffectType::kAddBounty},
+                {"scaleobject", EffectType::kScaleObject},
+                {"restorescale", EffectType::kRestoreScale},
+                {"modav", EffectType::kModActorValue},
+                {"spawnhazard", EffectType::kSpawnHazard},
+                {"swaphazard", EffectType::kSwapHazard},
+                {"dropharvest", EffectType::kDropHarvest},
+                {"changeweather", EffectType::kChangeWeather},
+                {"swapbaseobject", EffectType::kSwapBaseObject},
+                {"applyforce", EffectType::kApplyForce}
             };
 
 			static const std::unordered_map<EffectType, std::string> effectTypeReverseMap = []() {
@@ -2590,6 +3114,35 @@ namespace OIF {
 				}
 				return map;
 			}();
+
+			// Effects that take no formID/editorID/formlist at all - everything they need
+			// lives in plain fields. Used in two places: to allow an item entry with no
+			// form identifier, and (above, in the needsItems block) to accept those fields
+			// written directly on the effect object with no "items" wrapper.
+			static const std::vector<EffectType> kEffectsWithoutForm = {
+				EffectType::kApplyIngestible,
+				EffectType::kApplySpell,
+				EffectType::kRemoveLight,
+				EffectType::kEnableLight,
+				EffectType::kDisableLight,
+				EffectType::kPlayIdle,
+				EffectType::kToggleNode,
+				//EffectType::kToggleShaderFlag,
+				EffectType::kUnlockItem,
+				EffectType::kLockItem,
+				EffectType::kActivateItem,
+				EffectType::kExecuteConsoleCommand,
+				EffectType::kExecuteConsoleCommandOnItem,
+				EffectType::kExecuteConsoleCommandOnSource,
+				EffectType::kShowNotification,
+				EffectType::kShowMessageBox,
+				EffectType::kAddBounty,
+				EffectType::kScaleObject,
+				EffectType::kRestoreScale,
+				EffectType::kModActorValue,
+				EffectType::kApplyForce,
+				EffectType::kDropHarvest
+			};
 
             for (const auto& effj : effectArray) {
                 if (!effj.is_object()) continue;
@@ -2604,6 +3157,13 @@ namespace OIF {
                 }
 				eff.type = it->second;
 
+                // Optional: which stage of a staged effect sequence this specific effect
+                // entry belongs to. 0 (default, "stage" omitted) means "always fires,
+                // regardless of stage" - existing rules that never set this are completely
+                // unaffected. See Effect::atStage and the STAGE CHECK BLOCK in Trigger() for
+                // how the current stage is tracked and advanced.
+                eff.atStage = effj.value("stage", 0U);
+
                 const std::vector<EffectType> effectsWithoutItems = {
                     EffectType::kRemoveItem,
                     EffectType::kDisableItem,
@@ -2616,20 +3176,50 @@ namespace OIF {
 
                 bool needsItems = std::find(effectsWithoutItems.begin(), effectsWithoutItems.end(), eff.type) == effectsWithoutItems.end();
                 if (needsItems) {
+                    // An effect that takes no form (modav, applyforce, scaleobject,
+                    // restorescale, dropharvest, the notification/console ones...) has
+                    // nothing to put in "items" except its own settings, so writing
+                    //
+                    //   { "type": "modav", "actorvalue": "Health", "amount": -50 }
+                    //
+                    // instead of wrapping those same fields in a one-element "items"
+                    // array is the natural thing to do - and it used to be silently
+                    // fatal: the effect fell into the "requires 'items'" branch below
+                    // and was dropped from the rule entirely. Form-based effects were
+                    // unaffected, which is why only the form-free ones ever appeared
+                    // to "do nothing". Both spellings are now accepted; "items" still
+                    // wins if present, so nothing that already worked changes.
+                    json synthesizedItems;
+                    const json* itemArray = nullptr;
+
                     if (effj.contains("items") && effj["items"].is_array()) {
-						for (const auto& itemJson : effj["items"]) {
+                        itemArray = &effj["items"];
+                    } else if (std::find(kEffectsWithoutForm.begin(), kEffectsWithoutForm.end(), eff.type) != kEffectsWithoutForm.end()) {
+                        synthesizedItems = json::array({ effj });
+                        itemArray = &synthesizedItems;
+                        logger::info("Effect '{}' in {} has no \"items\" array - reading its settings from the effect object itself", typeStr, path.string());
+                    }
+
+                    if (itemArray) {
+						for (const auto& itemJson : *itemArray) {
 							EffectExtendedData extData;
 							extData.formID = nullptr;
 							try {
 								extData.nonDeletable = itemJson.value("nondeletable", 0U);
 								extData.spawnType = itemJson.value("spawntype", 4U);
 								extData.fade = itemJson.value("fade", 1U);
-								extData.duration = itemJson.value("duration", 1.0f);
+								// Hazards previously had no concept of a duration and would
+								// persist forever once spawned, so default to "never expire"
+								// (<= 0) for them specifically to keep existing rules working
+								// unchanged. Other effect types (effect shaders, art objects)
+								// already rely on the 1 second default.
+								extData.duration = itemJson.value("duration", (eff.type == EffectType::kSpawnHazard || eff.type == EffectType::kSwapHazard) ? -1.0f : 1.0f);
 								extData.string = itemJson.value("string", std::string{});
 								extData.mode = itemJson.value("mode", 0U);
 								extData.strings = itemJson.value("strings", std::vector<std::string>{});
 								//extData.flagNames = itemJson.value("flagnames", std::vector<std::string>{});
 								extData.rank = itemJson.value("rank", 0U);
+								extData.violent = itemJson.value("violent", 0U);
 							} catch (const std::exception& e) {
 								logger::warn("Skipping malformed item in effect '{}' of {}: {}", typeStr, path.string(), e.what());
 								continue;
@@ -2728,6 +3318,86 @@ namespace OIF {
 								extData.radius.useRandom = false;
 							}
 
+							if (itemJson.contains("amount") && (itemJson["amount"].is_number() || itemJson["amount"].is_object())) {
+								if (itemJson["amount"].is_number()) {
+									try {
+										extData.amount.value = itemJson["amount"].get<float>();
+										extData.amount.useRandom = false;
+									} catch (const std::exception& e) {
+										logger::warn("Invalid amount value in items of {}: {}", path.string(), e.what());
+										extData.amount.value = 0.0f;
+										extData.amount.useRandom = false;
+									}
+								} else if (itemJson["amount"].is_object()) {
+									const auto& amountObj = itemJson["amount"];
+
+									if (amountObj.contains("min") && amountObj["min"].is_number() &&
+										amountObj.contains("max") && amountObj["max"].is_number()) {
+										try {
+											extData.amount.min = amountObj["min"].get<float>();
+											extData.amount.max = amountObj["max"].get<float>();
+											extData.amount.useRandom = true;
+										} catch (const std::exception& e) {
+											logger::warn("Invalid random amount values in items of {}: {}", path.string(), e.what());
+											extData.amount.value = 0.0f;
+											extData.amount.useRandom = false;
+										}
+									} else {
+										logger::warn("Invalid amount object format in items of {}: missing min/max values", path.string());
+										extData.amount.value = 0.0f;
+										extData.amount.useRandom = false;
+									}
+								}
+							} else {
+								extData.amount.value = 0.0f;
+								extData.amount.useRandom = false;
+							}
+
+							// modav only: lets rules use the more readable "actorvalue" key
+							// instead of the generic "string" field.
+							if (itemJson.contains("actorvalue") && itemJson["actorvalue"].is_string()) {
+								extData.string = itemJson.value("actorvalue", std::string{});
+							}
+
+							// applyforce only: "amount" is the same underlying field modav's
+							// magnitude uses, but "applyforce" is the one effect name where
+							// writing "amount" for a push magnitude isn't the obvious choice -
+							// "force" reads far more naturally and is what the effect's own
+							// name suggests. A rule that used "force" here was silently
+							// parsed as force=0 (extData.amount's default) and then dropped
+							// by ApplyForce's own zero-force check, with nothing else in the
+							// log to explain why. Accepted as a straight alias for "amount";
+							// "amount" still wins if both are somehow present.
+							if (eff.type == EffectType::kApplyForce && itemJson.contains("force") &&
+								(itemJson["force"].is_number() || itemJson["force"].is_object()) &&
+								!itemJson.contains("amount")) {
+								const auto& forceVal = itemJson["force"];
+								if (forceVal.is_number()) {
+									try {
+										extData.amount.value = forceVal.get<float>();
+										extData.amount.useRandom = false;
+									} catch (const std::exception& e) {
+										logger::warn("Invalid force value in items of {}: {}", path.string(), e.what());
+									}
+								} else if (forceVal.is_object()) {
+									if (forceVal.contains("min") && forceVal["min"].is_number() &&
+										forceVal.contains("max") && forceVal["max"].is_number()) {
+										try {
+											extData.amount.min = forceVal["min"].get<float>();
+											extData.amount.max = forceVal["max"].get<float>();
+											extData.amount.useRandom = true;
+										} catch (const std::exception& e) {
+											logger::warn("Invalid random force values in items of {}: {}", path.string(), e.what());
+										}
+									} else {
+										logger::warn("Invalid force object format in items of {}: missing min/max values", path.string());
+									}
+								}
+							}
+
+							extData.affectSource = itemJson.value("affectsource", true);
+							extData.affectPlayer = itemJson.value("affectplayer", true);
+
 							if (itemJson.contains("scale") && (itemJson["scale"].is_number() || itemJson["scale"].is_object())) {
 								if (itemJson["scale"].is_number()) {
 									try {
@@ -2763,6 +3433,21 @@ namespace OIF {
 								extData.scale.value = -1.0f;
 								extData.scale.useRandom = false;
 							}
+
+							// scaleobject only: multiply the target's current scale by "scale"
+							// instead of setting it outright, so repeated hits compound
+							// (e.g. 2.0 then 3.0 -> 6.0 total) rather than each one
+							// overwriting the last.
+							extData.relative = itemJson.value("relative", false);
+
+							// changeweather only: skip the game's usual weather transition/fade
+							// and switch instantly instead.
+							extData.immediate = itemJson.value("immediate", false);
+
+							// swapbaseobject only: forwarded to Enable() during the collision/3D
+							// refresh - whether the reference's inventory should be reset.
+							// Matters mainly when swapping to/from a container.
+							extData.resetInventory = itemJson.value("resetinventory", false);
 
 							if (itemJson.contains("timer") && (itemJson["timer"].is_number() || itemJson["timer"].is_object())) {
 								if (itemJson["timer"].is_number()) {
@@ -2833,8 +3518,11 @@ namespace OIF {
 								// (or any other specifically-typed item) via RE::TESForm never consults
 								// that type's own EditorID cache and always fails, even for types like
 								// Sound Descriptors whose EditorIDs are natively available at runtime.
+								// Hazards hit the same issue, so they get the same treatment.
 								RE::TESForm* form = (eff.type == EffectType::kPlaySound)
 									? static_cast<RE::TESForm*>(GetFormFromEditorID<RE::BGSSoundDescriptorForm>(editorId))
+									: (eff.type == EffectType::kSpawnHazard)
+									? static_cast<RE::TESForm*>(GetFormFromEditorID<RE::BGSHazard>(editorId))
 									: GetFormFromEditorID<RE::TESForm>(editorId);
 								if (form) {
 									extData.formID = form;
@@ -2880,26 +3568,14 @@ namespace OIF {
 								}
 							}
 
-							const std::vector<EffectType> effectsWithoutForm = {
-								EffectType::kApplyIngestible,
-								EffectType::kApplySpell,
-								EffectType::kRemoveLight,
-								EffectType::kEnableLight,
-								EffectType::kDisableLight,
-								EffectType::kPlayIdle,
-								EffectType::kToggleNode,
-								//EffectType::kToggleShaderFlag,
-								EffectType::kUnlockItem,
-								EffectType::kLockItem,
-								EffectType::kActivateItem,
-								EffectType::kExecuteConsoleCommand,
-								EffectType::kExecuteConsoleCommandOnItem,
-								EffectType::kExecuteConsoleCommandOnSource,
-								EffectType::kShowNotification,
-								EffectType::kShowMessageBox
-							};
+							bool needsFormNot = std::find(kEffectsWithoutForm.begin(), kEffectsWithoutForm.end(), eff.type) == kEffectsWithoutForm.end();
 
-							bool needsFormNot = std::find(effectsWithoutForm.begin(), effectsWithoutForm.end(), eff.type) == effectsWithoutForm.end();
+							// Previously an item whose formID/editorID was missing, misspelled or written as an
+							// array (e.g. "editorID": ["Foo"]) was dropped with no log line at all, leaving an
+							// effect with zero items that silently did nothing.
+							if (needsFormNot && !haveIdentifier && !itemJson.contains("formlist")) {
+								logger::warn("Effect '{}' in {}: an item was skipped because it has no usable formID/editorID/formList. formID and editorID must be plain strings (\"editorID\": \"Foo\"), not arrays (\"editorID\": [\"Foo\"])", effectTypeReverseMap.at(eff.type), path.string());
+							}
 
 							if (haveIdentifier || !needsFormNot) {
 								auto formToAdd = needsFormNot ? extData.formID : nullptr;
@@ -2941,10 +3617,32 @@ namespace OIF {
 //██║░░░░░██║███████╗░░░██║░░░███████╗██║░░██║  ██║░╚═╝░██║██║░░██║░░░██║░░░╚█████╔╝██║░░██║
 //╚═╝░░░░░╚═╝╚══════╝░░░╚═╝░░░╚══════╝╚═╝░░╚═╝  ╚═╝░░░░░╚═╝╚═╝░░╚═╝░░░╚═╝░░░░╚════╝░╚═╝░░╚═╝
 
+    // Case-insensitive substring match against RE::MaterialIDToString(a_material) (e.g.
+    // "stone" matches kStone/kStoneStairs/kStoneHeavy/kStoneBroken/...). a_categories is
+    // already lowercased at JSON-parse time (see the materials/materialsnot parsing).
+    static bool MaterialMatchesAny(RE::MATERIAL_ID a_material, const std::unordered_set<std::string>& a_categories) {
+        std::string name = tolower_str(std::string(RE::MaterialIDToString(a_material)));
+        for (const auto& category : a_categories) {
+            if (name.find(category) != std::string::npos) return true;
+        }
+        return false;
+    }
+
     bool RuleManager::MatchFilter(const Filter& f, const RuleContext& ctx, Rule& currentRule) const {
         if (!CheckTimeFilters(f)) return false;
-		if (!ctx.target || ctx.target->IsDeleted() || !ctx.target->GetBaseObject()) return false;
-		auto* baseObj = ctx.target->GetBaseObject();
+
+		// Ground/water hits (kHitGround/kHitWater) have no TESObjectREFR target -
+		// RE::TESObjectLAND terrain and water planes are baked into the cell, not
+		// references, so ctx.target is intentionally nullptr and ctx.hitPos/
+		// ctx.hasHitPos carry the impact location instead. Every other event still
+		// requires a live target exactly as before.
+		const bool isGroundHit = (ctx.event == EventType::kHitGround || ctx.event == EventType::kHitWater);
+		if (!isGroundHit) {
+			if (!ctx.target || ctx.target->IsDeleted() || !ctx.target->GetBaseObject()) return false;
+		} else if (ctx.target && ctx.target->IsDeleted()) {
+			return false;
+		}
+		auto* baseObj = ctx.target ? ctx.target->GetBaseObject() : nullptr;
 
         if (!f.nearby.empty()) {
 			if (!ctx.target || ctx.target->IsDeleted() || !ctx.source) return false;
@@ -3049,22 +3747,32 @@ namespace OIF {
 
         if (!f.formTypes.empty()) {
             hasObjectIdentifiers = true;
-            if (f.formTypes.contains(baseObj->GetFormType())) {
+            if (baseObj && f.formTypes.contains(baseObj->GetFormType())) {
                 objectIdentifierMatch = true;
             }
         }
-        if (!f.formTypesNot.empty() && f.formTypesNot.contains(baseObj->GetFormType())) return false;
+        if (!f.formTypesNot.empty() && baseObj && f.formTypesNot.contains(baseObj->GetFormType())) return false;
         if (!f.formIDs.empty()) {
             hasObjectIdentifiers = true;
-			if (f.formIDs.contains(baseObj->GetFormID())) {
+			if (baseObj && f.formIDs.contains(baseObj->GetFormID())) {
                 objectIdentifierMatch = true;
             }
         }
-        if (!f.formIDsNot.empty() && f.formIDsNot.contains(baseObj->GetFormID())) return false;
+        if (!f.formIDsNot.empty() && baseObj && f.formIDsNot.contains(baseObj->GetFormID())) return false;
+        if (!f.references.empty()) {
+            hasObjectIdentifiers = true;
+            if (ctx.target && f.references.contains(ctx.target->GetFormID())) {
+                objectIdentifierMatch = true;
+            }
+        }
+        if (!f.referencesNot.empty() && ctx.target && f.referencesNot.contains(ctx.target->GetFormID())) return false;
         if (!f.formLists.empty()) {
             hasObjectIdentifiers = true;
             bool matched = false;
-            for (const auto& entry : f.formLists) {
+            // A ground hit has no base object to look up in the list, so there
+            // is nothing to match here - leave matched false and fall through
+            // to the hasObjectIdentifiers/objectIdentifierMatch check below.
+            for (const auto& entry : baseObj ? f.formLists : std::vector<FormListEntry>{}) {
                 auto* list = RE::TESForm::LookupByID<RE::BGSListForm>(entry.formID);
                 if (!list) continue;
 
@@ -3107,7 +3815,7 @@ namespace OIF {
                 }
             }
         }
-        if (!f.formListsNot.empty()) {
+        if (!f.formListsNot.empty() && baseObj) {
             for (const auto& entry : f.formListsNot) {
                 auto* list = RE::TESForm::LookupByID<RE::BGSListForm>(entry.formID);
                 if (!list) continue;
@@ -3119,7 +3827,7 @@ namespace OIF {
         }
         if (!f.keywords.empty()) {
             hasObjectIdentifiers = true;
-            auto* kwf = baseObj->As<RE::BGSKeywordForm>();
+            auto* kwf = baseObj ? baseObj->As<RE::BGSKeywordForm>() : nullptr;
             if (kwf) {
                 for (auto* kw : f.keywords) {
                     if (kw && kwf->HasKeyword(kw)) {
@@ -3130,7 +3838,7 @@ namespace OIF {
             }
         }
         if (!f.keywordsNot.empty()) {
-            auto* kwf = baseObj->As<RE::BGSKeywordForm>();
+            auto* kwf = baseObj ? baseObj->As<RE::BGSKeywordForm>() : nullptr;
             if (kwf) {
                 for (auto* kw : f.keywordsNot) {
                     if (kw && kwf->HasKeyword(kw)) return false;
@@ -3145,8 +3853,12 @@ namespace OIF {
             }
         }
 		if (f.lockLevel != -2) {
+			// A ground hit has no reference and therefore no lock - the only
+			// way it can satisfy this filter is "-1" (not locked).
 			bool matched = false;
-			if (auto lockData = ctx.target->extraList.GetByType<RE::ExtraLock>()) {
+			if (!ctx.target) {
+				matched = (f.lockLevel == -1);
+			} else if (auto lockData = ctx.target->extraList.GetByType<RE::ExtraLock>()) {
 				if (auto* lock = lockData->lock) {
 					RE::LOCK_LEVEL lvl = lock->GetLockLevel(ctx.target);
 					if (lvl == GetLockLevel(f.lockLevel)) {
@@ -3160,7 +3872,9 @@ namespace OIF {
 		}
 		if (f.lockLevelNot != -2) {
 			bool matched = false;
-			if (auto lockData = ctx.target->extraList.GetByType<RE::ExtraLock>()) {
+			if (!ctx.target) {
+				matched = (f.lockLevelNot == -1);
+			} else if (auto lockData = ctx.target->extraList.GetByType<RE::ExtraLock>()) {
 				if (auto* lock = lockData->lock) {
 					RE::LOCK_LEVEL lvl = lock->GetLockLevel(ctx.target);
 					if (lvl == GetLockLevel(f.lockLevelNot)) {
@@ -3173,15 +3887,19 @@ namespace OIF {
 			if (matched) return false;
 		}
 		if (f.isStacked != 2) {
-			if (f.isStacked == 0 && ctx.target->extraList.GetCount() > 1) return false;
-			if (f.isStacked == 1 && ctx.target->extraList.GetCount() <= 1) return false;
+			// No target reference means no extraList to stack - treat a
+			// ground hit as "not stacked".
+			std::uint32_t extraCount = ctx.target ? ctx.target->extraList.GetCount() : 0;
+			if (f.isStacked == 0 && extraCount > 1) return false;
+			if (f.isStacked == 1 && extraCount <= 1) return false;
 		}
 		if (f.isParented != 2) {
 			// Skyrim stores a reference's Creation Kit "Enable Parent" in
 			// ExtraEnableStateParent. Treat the filter as parented only when
-			// the extra data exists and resolves to a valid reference.
+			// the extra data exists and resolves to a valid reference. A
+			// ground hit has no reference, so it is never parented.
 			bool hasParent = false;
-			if (auto* parentData = ctx.target->extraList.GetByType<RE::ExtraEnableStateParent>()) {
+			if (auto* parentData = ctx.target ? ctx.target->extraList.GetByType<RE::ExtraEnableStateParent>() : nullptr) {
 				hasParent = parentData->parent.get() != nullptr;
 			}
 
@@ -3189,26 +3907,139 @@ namespace OIF {
 			if (f.isParented == 0 && hasParent) return false;
 		}
 		if (f.isOwned != 2) {
-			auto* owner = ctx.target->GetOwner();
-			auto* player = RE::PlayerCharacter::GetSingleton();
+			// A ground hit has no reference to own, so it is always unowned.
+			const bool hasOwner = ctx.target && ctx.target->GetOwner() != nullptr;
 
-			const bool hasOwner = owner != nullptr;
-			const bool hasNonPlayerOwner = hasOwner && owner != player;
+			// 4/5 add player-ownership exclusion to the ownership matching.
+			bool playerOwned = false;
+			if (ctx.target) {
+				if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+					auto* playerBase = player->GetActorBase();
 
-			// Original behavior: isOwned 1 = has any owner
-			if (f.isOwned == 1 && !hasOwner)
-				return false;
+					if (auto* ownership = ctx.target->extraList.GetByType<RE::ExtraOwnership>(); ownership && ownership->owner) {
+						playerOwned = ownership->owner == playerBase || ownership->owner == player;
+					}
 
-			// New behavior: isOwned 0 = no owner OR player-owned
-			if (f.isOwned == 0 && hasNonPlayerOwner)
-				return false;
+					// Also use Skyrim's ownership test as a fallback for ownership
+					// states not represented by an explicit ExtraOwnership entry.
+					if (!playerOwned) {
+						playerOwned = ctx.target->IsAnOwner(player, false, true);
+					}
+
+					if (!playerOwned && playerBase) {
+						playerOwned = ctx.target->GetOwner() == playerBase || ctx.target->GetOwner() == player;
+					}
+				}
+			}
+
+			// 4: allow unowned references OR player-owned references.
+			//     Excludes NPC/faction/other non-player ownership.
+			// 5: allow owned references that are NOT player-owned (NPC/faction-owned).
+			if (f.isOwned == 3 && hasOwner && !playerOwned) return false;
+			if (f.isOwned == 4 && (!hasOwner || playerOwned)) return false;
+			if (f.isOwned == 1 && !hasOwner) return false;
+			if (f.isOwned == 0 && hasOwner) return false;
 		}
 		if (f.isInterior != 2) {
-			auto* cell = ctx.target->GetParentCell();
+			// Ground hits have no target cell of their own - fall back to the
+			// source actor's cell, which is where the impact actually happened.
+			auto* cell = ctx.target ? ctx.target->GetParentCell() : (ctx.source ? ctx.source->GetParentCell() : nullptr);
 			if (!cell) return false;
 			bool interior = cell->IsInteriorCell();
 			if (f.isInterior == 0 && interior) return false;
 			if (f.isInterior == 1 && !interior) return false;
+		}
+		if (f.isTeleportDoor != 2) {
+			// Ground/water hits have no door to check at all.
+			if (!ctx.target) return false;
+
+			auto* doorBase = baseObj ? baseObj->As<RE::TESObjectDOOR>() : nullptr;
+			if (!doorBase) return false;	// Not a door - this filter doesn't apply
+
+			// A door reference only carries ExtraTeleport data when it's actually set up
+			// as a load door (linked to a destination door/position elsewhere). A door
+			// with no ExtraTeleport just opens/closes in place - a cell gate, cabinet
+			// door, portcullis, etc.
+			bool teleports = ctx.target->extraList.GetByType<RE::ExtraTeleport>() != nullptr;
+			if (f.isTeleportDoor == 1 && !teleports) return false;
+			if (f.isTeleportDoor == 0 && teleports) return false;
+		}
+		if (f.isInWater != 3) {
+			// 0 - not touching water, 1 - on the surface (straddles the waterline),
+			// 2 - fully submerged.
+			std::uint32_t waterState = 0;
+
+			if (!ctx.target) {
+				// kHitGround/kHitWater already know which surface they landed on -
+				// no need to re-derive it from a position, and re-deriving it here
+				// would be unreliable anyway (a kHitWater impact position sits right
+				// at the tolerance band used to detect it in the first place, so a
+				// strict bound comparison could easily land back on "not in water").
+				if (!ctx.hasHitPos) return false;
+				waterState = (ctx.event == EventType::kHitWater) ? 1 : 0;
+			} else {
+				// FindWaterHeightAtPosition (EventSinks.cpp) walks TESWaterSystem's global
+				// water-volume list directly rather than asking a specific cell, so it works
+				// correctly regardless of which cell object the target happens to sit in -
+				// see the comment on its declaration in RuleManager.h. Adapted from
+				// RavenKZP's Frostwalker: https://github.com/RavenKZP/Frostwalker.
+				float waterHeight = 0.0f;
+				// HasGroundAtOrAboveWater is the same shoreline gate the kHitWater
+				// hooks use: a cell's water height applies to the whole cell and the
+				// water-volume footprint test is only a coarse bounding box, so both
+				// report "water" over a wide band of dry land around every shoreline.
+				// Without this, an object resting on a riverbank that happens to sit
+				// below the cell's water height matched isinwater 1/2.
+				const RE::NiPoint3 targetPos = ctx.target->GetPosition();
+				if (FindWaterHeightAtPosition(targetPos, waterHeight) &&
+					!HasGroundAtOrAboveWater(targetPos, waterHeight)) {
+					// GetBoundMin()/GetBoundMax() are object-space and need the
+					// target's own scale and world position applied to get the
+					// actual world-space top/bottom of the object.
+					const float scale = ctx.target->GetScale();
+					const float boundBottom = ctx.target->GetPositionZ() + ctx.target->GetBoundMin().z * scale;
+					const float boundTop = ctx.target->GetPositionZ() + ctx.target->GetBoundMax().z * scale;
+
+					if (boundTop <= waterHeight) {
+						waterState = 2;
+					} else if (boundBottom <= waterHeight) {
+						waterState = 1;
+					}
+				}
+			}
+
+			if (f.isInWater != waterState) return false;
+		}
+		if (!f.materials.empty() || !f.materialsNot.empty()) {
+			// Currently only resolved for rules with a real target (hit-on-object,
+			// activate-object, etc.) - see ResolveTargetMaterials' own comment for why
+			// kHitGround/kHitWater (no target) aren't wired up yet. A ground/water hit
+			// simply never matches either set for now, same as other target-only
+			// filters (e.g. isTeleportDoor) already do above.
+			if (!ctx.target) return false;
+
+			// An object can carry several collision bodies with different materials (a stone
+			// building with a wooden door part, ...). `materials` matches if ANY of them matches;
+			// `materialsNot` rejects if ANY of them matches.
+			std::vector<RE::MATERIAL_ID> targetMaterials;
+			const bool materialKnown = ResolveTargetMaterials(ctx.target, targetMaterials);
+
+			if (!f.materials.empty()) {
+				// needs positive evidence - an unreadable material can't be "stone" or "wood"
+				if (!materialKnown) return false;
+				bool anyMatch = false;
+				for (const auto material : targetMaterials) {
+					if (MaterialMatchesAny(material, f.materials)) { anyMatch = true; break; }
+				}
+				if (!anyMatch) return false;
+			}
+
+			// an unreadable material simply has nothing to exclude, so materialsNot passes
+			if (!f.materialsNot.empty() && materialKnown) {
+				for (const auto material : targetMaterials) {
+					if (MaterialMatchesAny(material, f.materialsNot)) return false;
+				}
+			}
 		}
 		if (f.position != 3) {
 			auto player = RE::PlayerCharacter::GetSingleton();
@@ -3217,7 +4048,12 @@ namespace OIF {
 			NiPoint3 targetCenter = { 0.0f, 0.0f, 0.0f };
 			NiPoint3 playerCenter = { 0.0f, 0.0f, 0.0f };
 
-			if (auto* root = ctx.target->Get3D()) {
+			if (!ctx.target) {
+				// Ground hits have no bounding box - use the actual impact
+				// position instead.
+				if (!ctx.hasHitPos) return false;
+				targetCenter = ctx.hitPos;
+			} else if (auto* root = ctx.target->Get3D()) {
 				targetCenter = root->worldBound.center;
 			} else {
 				const auto& bmin = ctx.target->GetBoundMin();
@@ -3320,6 +4156,37 @@ namespace OIF {
                 if (spell && actor->HasSpell(spell)) return false;
             }
         }
+        if (!f.shouts.empty()) {
+            if (!ctx.source) return false;
+            auto* actor = ctx.source->As<RE::Actor>();
+            if (!actor) return false;
+            bool hasAny = false;
+            for (const auto& shoutID : f.shouts) {
+                auto* shout = RE::TESForm::LookupByID<RE::TESShout>(shoutID);
+                if (shout && actor->HasShout(shout)) {
+                    hasAny = true;
+                    break;
+                }
+            }
+            if (!hasAny) return false;
+        }
+        if (!f.shoutsNot.empty()) {
+            if (!ctx.source) return false;
+            auto* actor = ctx.source->As<RE::Actor>();
+            if (!actor) return false;
+            for (const auto& shoutID : f.shoutsNot) {
+                auto* shout = RE::TESForm::LookupByID<RE::TESShout>(shoutID);
+                if (shout && actor->HasShout(shout)) return false;
+            }
+        }
+        if (!f.shoutWordsKnown.empty()) {
+            for (const auto& cond : f.shoutWordsKnown) {
+                auto* shout = RE::TESForm::LookupByID<RE::TESShout>(cond.shoutID);
+                if (!shout) return false;
+                auto known = CountKnownShoutWords(shout);
+                if (known < cond.minWords || known > cond.maxWords) return false;
+            }
+        }
         if (!f.hasItem.empty()) {
             if (!ctx.source) return false;
             bool hasAnyItem = false;
@@ -3335,6 +4202,25 @@ namespace OIF {
             if (!ctx.source) return false;
             for (auto formID : f.hasItemNot) {
                 if (HasItem(ctx.source, formID)) {
+                    return false;
+                }
+            }
+        }
+        if (!f.isEquip.empty()) {
+            if (!ctx.source) return false;
+            bool hasAnyEquipped = false;
+            for (auto formID : f.isEquip) {
+                if (IsEquipped(ctx.source, formID)) {
+                    hasAnyEquipped = true;
+                    break;
+                }
+            }
+            if (!hasAnyEquipped) return false;
+        }
+        if (!f.isEquipNot.empty()) {
+            if (!ctx.source) return false;
+            for (auto formID : f.isEquipNot) {
+                if (IsEquipped(ctx.source, formID)) {
                     return false;
                 }
             }
@@ -3575,16 +4461,81 @@ namespace OIF {
 //╚══════╝╚═╝░░░░░╚═╝░░░░░╚══════╝░╚════╝░░░░╚═╝░░░╚═════╝░  ╚═╝░░╚═╝╚═╝░░░░░╚═╝░░░░░╚══════╝░░░╚═╝░░░
 
     void RuleManager::ApplyEffect(const Effect& eff, const RuleContext& ctx, Rule& currentRule) const {     
-        if (!ctx.target || !ctx.target->GetBaseObject()) return;
+        // AddBounty only affects the player and never touches ctx.target, so it shouldn't be
+        // gated on target validity the way target-based effects need to be - otherwise it can
+        // be silently blocked if the triggering object was deleted/disabled by an earlier
+        // effect in the same rule. ChangeWeather is exempted for the same reason - it acts on
+        // the world/sky globally and has nothing to do with ctx.target either.
+        //
+        // kHitGround/kHitWater events have no target at all (RE::TESObjectLAND terrain and
+        // water planes aren't TESObjectREFRs) - only the position-based spawn/sound/
+        // notification effects know how to work from ctx.hitPos instead, so only those are
+        // exempted here.
+        const bool isGroundHitEffect = (ctx.event == EventType::kHitGround || ctx.event == EventType::kHitWater) && (
+            eff.type == EffectType::kSpawnItem ||
+            eff.type == EffectType::kSpawnActor ||
+            eff.type == EffectType::kSpawnSpell ||
+            eff.type == EffectType::kSpawnImpactDataSet ||
+            eff.type == EffectType::kSpawnImpact ||
+            eff.type == EffectType::kSpawnExplosion ||
+            eff.type == EffectType::kSpawnHazard ||
+            eff.type == EffectType::kPlaySound ||
+            eff.type == EffectType::kShowNotification ||
+            // THIS IS WHY modav AND applyforce "DID NOTHING" ON hitground/hitwater RULES.
+            // Both are radius effects centered on ctx.hitPos that never touch ctx.target
+            // at all - but they weren't on this list, so requiresTarget stayed true and
+            // the `if (!ctx.target ...) return;` below dropped the whole effect before it
+            // ever reached the switch. Ground and water hits have no target by design
+            // (terrain and water planes aren't TESObjectREFRs), so every such rule was
+            // silently discarded here with no log line to show for it.
+            eff.type == EffectType::kModActorValue ||
+            eff.type == EffectType::kApplyForce ||
+            // Same reasoning: these act on the player or the world, not on ctx.target.
+            // (kExecuteConsoleCommand deliberately NOT here - it searches for actors
+            // around ctx.target and bails immediately without one.)
+            eff.type == EffectType::kShowMessageBox ||
+            eff.type == EffectType::kExecuteConsoleCommandOnSource ||
+            // SAME BUG AS modav/applyforce ABOVE: each of these already has a full,
+            // dedicated ground/water-hit path in Effects.cpp (isGroundHit branch that
+            // spawns off ctx.hitPos via ResolveGroundHitAnchor/SpawnAtPosition, or -
+            // for the shader/art-object/leveled-spell cases - a throwaway dummy
+            // marker reference placed at ctx.hitPos) but were never added to this
+            // allow-list, so requiresTarget stayed true and `if (!ctx.target...)
+            // return;` below silently discarded every HitGround/HitWater rule using
+            // them before Effects.cpp's own ground-hit logic ever ran.
+            eff.type == EffectType::kSpawnLeveledItem ||
+            eff.type == EffectType::kSpawnLeveledActor ||
+            eff.type == EffectType::kSpawnLeveledSpell ||
+            eff.type == EffectType::kSpawnEffectShader ||
+            eff.type == EffectType::kSpawnArtObject
+        );
+        const bool requiresTarget = eff.type != EffectType::kAddBounty && eff.type != EffectType::kChangeWeather && !isGroundHitEffect;
+
+        if (requiresTarget) {
+            if (!ctx.target || !ctx.target->GetBaseObject()) return;
+        }
         if (!ctx.source || !ctx.source->GetBaseObject()) return;
 
-        SKSE::GetTaskInterface()->AddTask([this, eff, ctx, currentRule]() {
+        // ctx holds raw pointers and this task runs on a later frame: capture handles now and
+        // re-resolve them inside the task (see DeferredRefs). `mutable` so the resolved
+        // pointers can be written back into the lambda's own ctx copy - everything below,
+        // including every Effects:: call, then sees live references only.
+        SKSE::GetTaskInterface()->AddTask([this, eff, ctx = ctx, deferredRefs = DeferredRefs::Capture(ctx), currentRule, requiresTarget]() mutable {
+            RE::NiPointer<RE::TESObjectREFR> sourceKeepAlive;
+            RE::NiPointer<RE::TESObjectREFR> targetKeepAlive;
+            if (!deferredRefs.Resolve(ctx, sourceKeepAlive, targetKeepAlive)) {
+                logger::warn("Source is invalid, dead or deleted");
+                return;
+            }
+
             auto* target = ctx.target;
             auto* source = ctx.source;
 
-            if (!target || target->IsDeleted()) {
-                logger::warn("Target is invalid or deleted");
-                return;
+            if (requiresTarget) {
+                if (!target || target->IsDeleted()) {
+                    logger::warn("Target is invalid or deleted");
+                    return;
+                }
             }
 
             if (!source || source->IsDeleted()) {
@@ -3592,26 +4543,31 @@ namespace OIF {
                 return;
             }
 
-            auto* targetBase = target->GetBaseObject();
-            auto* sourceBase = source->GetBaseObject();
-
-            if (!targetBase) {
-                logger::warn("Target base object is invalid or deleted");
-                return;
+            RE::TESForm* targetBase = nullptr;
+            if (requiresTarget) {
+                targetBase = target->GetBaseObject();
+                if (!targetBase) {
+                    logger::warn("Target base object is invalid or deleted");
+                    return;
+                }
             }
+
+            auto* sourceBase = source->GetBaseObject();
 
             if (!sourceBase) {
                 logger::warn("Source base object is invalid or deleted");
                 return;
             }
 
-            auto targetFormID = targetBase->GetFormID();
-            auto sourceFormID = sourceBase->GetFormID();
-        
-            if (!targetFormID) {
-                logger::warn("Target formID is invalid");
-                return;
+            if (requiresTarget) {
+                auto targetFormID = targetBase->GetFormID();
+                if (!targetFormID) {
+                    logger::warn("Target formID is invalid");
+                    return;
+                }
             }
+
+            auto sourceFormID = sourceBase->GetFormID();
 
             if (!sourceFormID) {
                 logger::warn("Source formID is invalid");
@@ -3780,6 +4736,18 @@ namespace OIF {
                                 return LvlActorSpawnData(lvlc, ext.string, ext.count, ext.spawnType, ext.fade, ext.scale, ext.nonDeletable);
                             },
                             Effects::SwapLeveledActor
+                        );
+                    }
+                    break;
+
+                    case EffectType::kSpawnImpact:
+                    {
+                        ProcessEffect<RE::BGSImpactData, ImpactSpawnData>(
+                            eff, ctx, currentRule, true,
+                            [](auto* impact, const EffectExtendedData& ext) {
+                                return ImpactSpawnData(impact, ext.count);
+                            },
+                            Effects::SpawnImpact
                         );
                     }
                     break;
@@ -4116,6 +5084,126 @@ namespace OIF {
                         );
                     }
                     break;
+
+                    case EffectType::kAddBounty:
+                    {
+                        ProcessEffect<void, BountyData>(
+                            eff, ctx, currentRule, false,
+                            [](std::nullptr_t, const EffectExtendedData& ext) {
+                                return BountyData{ ext.count, ext.violent != 0 };
+                            },
+                            Effects::AddBounty
+                        );
+                    }
+                    break;
+
+                    case EffectType::kScaleObject:
+                    {
+                        ProcessEffect<void, ScaleObjectData>(
+                            eff, ctx, currentRule, false,
+                            [](std::nullptr_t, const EffectExtendedData& ext) {
+                                return ScaleObjectData{ ext.scale, ext.fade, ext.relative };
+                            },
+                            Effects::ScaleObject
+                        );
+                    }
+                    break;
+
+                    case EffectType::kRestoreScale:
+                    {
+                        ProcessEffect<void, RestoreScaleData>(
+                            eff, ctx, currentRule, false,
+                            [](std::nullptr_t, const EffectExtendedData& ext) {
+                                return RestoreScaleData{ ext.fade };
+                            },
+                            Effects::RestoreObjectScale
+                        );
+                    }
+                    break;
+
+                    case EffectType::kModActorValue:
+                    {
+                        ProcessEffect<void, ModActorValueData>(
+                            eff, ctx, currentRule, false,
+                            [](std::nullptr_t, const EffectExtendedData& ext) {
+                                return ModActorValueData{ ext.string, ext.amount, ext.radius, ext.affectSource, ext.affectPlayer };
+                            },
+                            Effects::ModActorValue
+                        );
+                    }
+                    break;
+
+                    case EffectType::kApplyForce:
+                    {
+                        ProcessEffect<void, ForceApplyData>(
+                            eff, ctx, currentRule, false,
+                            [](std::nullptr_t, const EffectExtendedData& ext) {
+                                return ForceApplyData{ ext.amount, ext.radius, ext.affectSource, ext.affectPlayer };
+                            },
+                            Effects::ApplyForce
+                        );
+                    }
+                    break;
+
+                    case EffectType::kSpawnHazard:
+                    {
+                        ProcessEffect<RE::BGSHazard, HazardSpawnData>(
+                            eff, ctx, currentRule, true,
+                            [](auto* hazard, const EffectExtendedData& ext) {
+                                return HazardSpawnData(hazard, ext.string, ext.count, ext.spawnType, ext.fade, ext.duration, ext.nonDeletable);
+                            },
+                            Effects::SpawnHazard
+                        );
+                    }
+                    break;
+
+                    case EffectType::kSwapHazard:
+                    {
+                        ProcessEffect<RE::BGSHazard, HazardSpawnData>(
+                            eff, ctx, currentRule, true,
+                            [](auto* hazard, const EffectExtendedData& ext) {
+                                return HazardSpawnData(hazard, ext.string, ext.count, ext.spawnType, ext.fade, ext.duration, ext.nonDeletable);
+                            },
+                            Effects::SwapHazard
+                        );
+                    }
+                    break;
+
+                    case EffectType::kDropHarvest:
+                    {
+                        ProcessEffect<void, HarvestSpawnData>(
+                            eff, ctx, currentRule, false,
+                            [](std::nullptr_t, const EffectExtendedData& ext) {
+                                return HarvestSpawnData{ ext.count, ext.scale, ext.spawnType, ext.fade };
+                            },
+                            Effects::DropHarvest
+                        );
+                    }
+                    break;
+
+                    case EffectType::kChangeWeather:
+                    {
+                        ProcessEffect<RE::TESWeather, WeatherChangeData>(
+                            eff, ctx, currentRule, true,
+                            [](auto* weather, const EffectExtendedData& ext) {
+                                return WeatherChangeData{ weather, ext.immediate };
+                            },
+                            Effects::ChangeWeather
+                        );
+                    }
+                    break;
+
+                    case EffectType::kSwapBaseObject:
+                    {
+                        ProcessEffect<RE::TESBoundObject, BaseObjectSwapData>(
+                            eff, ctx, currentRule, true,
+                            [](auto* newBase, const EffectExtendedData& ext) {
+                                return BaseObjectSwapData{ newBase, ext.fade, ext.resetInventory };
+                            },
+                            Effects::SwapBaseObject
+                        );
+                    }
+                    break;
                                 
                 default:
                     logger::warn("Unknown effect type {}", static_cast<int>(eff.type));
@@ -4161,6 +5249,24 @@ namespace OIF {
             logger::debug("Cleaned {} unused limit entries, remaining: {}", removedCount, _limitCounts.size());
         }
 
+        // Same idea as _limitCounts above - _stageCounts is meant to persist for as long as
+        // a given (source, target, rule) combo might still be relevant, so only ever trim
+        // entries that were somehow never actually used (should be rare/never in practice,
+        // since a stage entry is only created at the same moment it's incremented to 1).
+        if (_stageCounts.size() > 500) {
+            std::size_t removedCount = 0;
+            auto it = _stageCounts.begin();
+            while (it != _stageCounts.end()) {
+                if (it->second == 0) {
+                    it = _stageCounts.erase(it);
+                    ++removedCount;
+                } else {
+                    ++it;
+                }
+            }
+            logger::debug("Cleaned {} unused stage entries, remaining: {}", removedCount, _stageCounts.size());
+        }
+
         // Emergency cleanup if counts grow too large
         if (_interactionsCounts.size() > 1000) {
             logger::warn("Emergency interactions cleanup!");
@@ -4173,6 +5279,17 @@ namespace OIF {
             while (it != _limitCounts.end()) {
                 if (it->second == 0) {
                     it = _limitCounts.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        if (_stageCounts.size() > 1000) {
+            auto it = _stageCounts.begin();
+            while (it != _stageCounts.end()) {
+                if (it->second == 0) {
+                    it = _stageCounts.erase(it);
                 } else {
                     ++it;
                 }
@@ -4191,9 +5308,18 @@ namespace OIF {
         // Save critical data to prevent potential loss
         auto localTarget = ctx.target;
         auto localSource = ctx.source;
-        if (!localTarget || localTarget->IsDeleted() || !localSource || localSource->IsDeleted()) return;
 
-        auto targetFormID = localTarget->GetFormID();
+        // Ground/water hits (kHitGround/kHitWater) are the event types that legitimately
+        // have no TESObjectREFR target - RE::TESObjectLAND terrain and water planes
+        // aren't references, so ctx.target is nullptr by design there and ctx.hitPos
+        // carries the impact location instead. Every other event still requires a live
+        // target the way it always has.
+        const bool isGroundHit = (ctx.event == EventType::kHitGround || ctx.event == EventType::kHitWater);
+        if (!isGroundHit && (!localTarget || localTarget->IsDeleted())) return;
+        if (localTarget && localTarget->IsDeleted()) return;
+        if (!localSource || localSource->IsDeleted()) return;
+
+        auto targetFormID = localTarget ? localTarget->GetFormID() : 0u;
         auto sourceFormID = localSource->GetFormID();
 
 		// ╔════════════════════════════════════╗
@@ -4305,6 +5431,27 @@ namespace OIF {
 			if (!interactionCheckPassed) continue;
 
 			// ╔════════════════════════════════════╗
+			// ║         STAGE CHECK BLOCK          ║
+			// ╚════════════════════════════════════╝
+			// Advances once per successful rule match (same timing as limit/interactions
+			// above, and independent of the chance roll below - a rule that matches but
+			// loses its chance roll still counts as "an interaction happened" for staging
+			// purposes, same as it already does for limit/interactions). Unlike
+			// interactions, this never resets on its own: it's a permanent, ever-increasing
+			// count of how many times this (source, target, rule) combo has matched, and
+			// it's what Effect::atStage compares against down in the effects-applying
+			// sections below to decide whether a given effect entry fires this time. A
+			// rule with no staged effects at all (every Effect::atStage left at its 0
+			// default) is completely unaffected - the counter still advances, but nothing
+			// ever checks it.
+			Key stageKey{
+				sourceFormID,
+				targetFormID,
+				static_cast<std::uint16_t>(ruleIdx)
+			};
+			const std::uint32_t currentStage = ++_stageCounts[stageKey];
+
+			// ╔════════════════════════════════════╗
 			// ║         TIMER CHECK BLOCK          ║
 			// ╚════════════════════════════════════╝
 
@@ -4355,14 +5502,30 @@ namespace OIF {
 					static std::vector<std::future<void>> timerTasks;
 					static std::mutex timerMutex;
 
-					auto timerFuture = std::async(std::launch::async, [this, r, ctx, timerBlockApplied, timer = r.filter.timer.time.value]() {
+					// Snapshot the references as handles NOW, while ctx is still valid. The raw
+					// pointers in ctx must not be trusted after the sleep below: the target can be
+					// freed during the delay and its memory reused by something unrelated.
+					const DeferredRefs deferredRefs = DeferredRefs::Capture(ctx);
+
+					auto timerFuture = std::async(std::launch::async, [this, r, ctx, deferredRefs, timerBlockApplied, timer = r.filter.timer.time.value, currentStage]() {
 						std::this_thread::sleep_for(std::chrono::duration<float>(timer));
 
-						SKSE::GetTaskInterface()->AddTask([this, r, ctx, timerBlockApplied]() mutable {
+						SKSE::GetTaskInterface()->AddTask([this, r, ctx = ctx, deferredRefs, timerBlockApplied, currentStage]() mutable {
+							// Re-resolve from handles; the NiPointers keep both references alive
+							// for the whole task, including the ApplyEffect calls below.
+							RE::NiPointer<RE::TESObjectREFR> sourceKeepAlive;
+							RE::NiPointer<RE::TESObjectREFR> targetKeepAlive;
+							if (!deferredRefs.Resolve(ctx, sourceKeepAlive, targetKeepAlive)) {
+								logger::warn("Source is invalid or deleted after timer");
+								return;
+							}
+
 							auto* target = ctx.target;
 							auto* source = ctx.source;
 
-							if (!target || target->IsDeleted()) {
+							// Ground/water hits never have a target - only require one
+							// for every other event type.
+							if (ctx.event != EventType::kHitGround && ctx.event != EventType::kHitWater && (!target || target->IsDeleted())) {
 								logger::warn("Target is invalid or deleted after timer");
 								return;
 							}
@@ -4379,6 +5542,7 @@ namespace OIF {
 							float globalRoll = std::uniform_real_distribution<float>(0.f, 100.f)(rng);
 							if (globalRoll < r.filter.chance.value) {
 								for (auto& eff : r.effects) {
+									if (eff.atStage != 0 && eff.atStage != currentStage) continue;
 									for (auto& [form, extData] : eff.items) {
 										if (extData.count.useRandom) {
 											extData.count.value = std::uniform_int_distribution<std::uint32_t>(extData.count.min, extData.count.max)(rng);
@@ -4421,6 +5585,7 @@ namespace OIF {
 				float globalRoll = std::uniform_real_distribution<float>(0.f, 100.f)(rng);
 				if (globalRoll < r.filter.chance.value) {
 					for (auto& eff : r.effects) {
+						if (eff.atStage != 0 && eff.atStage != currentStage) continue;
 						for (auto& [form, extData] : eff.items) {
 							if (extData.count.useRandom) {
 								extData.count.value = std::uniform_int_distribution<std::uint32_t>(extData.count.min, extData.count.max)(rng);
